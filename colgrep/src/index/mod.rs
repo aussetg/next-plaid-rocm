@@ -44,6 +44,15 @@ const MAX_FILE_SIZE: u64 = 512 * 1024;
 /// Number of documents to process before writing to the index.
 /// Larger values reduce I/O overhead but use more memory.
 const INDEX_CHUNK_SIZE: usize = 1024;
+/// Larger default chunk sizes for medium/large real-code indexes.
+///
+/// Benchmarks on ROCm tuning corpora showed 1024 remains best for many short
+/// units, while real code with longer units benefits from fewer, larger chunks.
+const MEDIUM_INDEX_CHUNK_SIZE: usize = 2048;
+const LARGE_INDEX_CHUNK_SIZE: usize = 4096;
+const MEDIUM_INDEX_CHUNK_UNITS: usize = 4_096;
+const LARGE_INDEX_CHUNK_UNITS: usize = 8_192;
+const SHORT_UNIT_AVG_CODE_BYTES: usize = 256;
 
 /// Threshold for switching to higher pool factor (fewer embeddings per doc).
 /// When encoding more than this many units, use LARGE_BATCH_POOL_FACTOR.
@@ -202,6 +211,43 @@ fn prepare_units_for_encoding(units: &[CodeUnit], sample_prefix_size: usize) -> 
     } else {
         items
     }
+}
+
+fn average_unit_code_bytes(units: &[CodeUnit]) -> usize {
+    if units.is_empty() {
+        return 0;
+    }
+    units.iter().map(|unit| unit.code.len()).sum::<usize>() / units.len()
+}
+
+fn default_index_chunk_size_for_units(units: &[CodeUnit]) -> usize {
+    let num_units = units.len();
+    if num_units < MEDIUM_INDEX_CHUNK_UNITS {
+        return INDEX_CHUNK_SIZE;
+    }
+
+    // Very small units are dominated by k-means/index-write cost when chunks
+    // get too large. Keep the historical 1024 default for those workloads.
+    if average_unit_code_bytes(units) < SHORT_UNIT_AVG_CODE_BYTES {
+        return INDEX_CHUNK_SIZE;
+    }
+
+    if num_units >= LARGE_INDEX_CHUNK_UNITS {
+        LARGE_INDEX_CHUNK_SIZE
+    } else {
+        MEDIUM_INDEX_CHUNK_SIZE
+    }
+}
+
+fn resolve_index_chunk_size(
+    configured_index_chunk_size: Option<usize>,
+    encode_batch_size: usize,
+    units: &[CodeUnit],
+) -> usize {
+    configured_index_chunk_size
+        .unwrap_or_else(|| default_index_chunk_size_for_units(units))
+        .max(encode_batch_size)
+        .max(1)
 }
 
 /// Deduplicate code units with identical embedding text within a chunk.
@@ -1568,10 +1614,8 @@ impl IndexBuilder {
         std::fs::create_dir_all(index_path)?;
 
         let encode_batch_size = self.encode_batch_size.unwrap_or(DEFAULT_ENCODE_BATCH_SIZE);
-        let index_chunk_size = self
-            .index_chunk_size
-            .unwrap_or(INDEX_CHUNK_SIZE)
-            .max(encode_batch_size);
+        let index_chunk_size =
+            resolve_index_chunk_size(self.index_chunk_size, encode_batch_size, &new_units);
 
         // Compute effective pool factor based on batch size
         let pool_factor = self.resolve_pool_factor(new_units.len());
@@ -1909,10 +1953,8 @@ impl IndexBuilder {
             pb.set_message("Encoding...");
 
             let encode_batch_size = self.encode_batch_size.unwrap_or(DEFAULT_ENCODE_BATCH_SIZE);
-            let index_chunk_size = self
-                .index_chunk_size
-                .unwrap_or(INDEX_CHUNK_SIZE)
-                .max(encode_batch_size);
+            let index_chunk_size =
+                resolve_index_chunk_size(self.index_chunk_size, encode_batch_size, &new_units);
 
             // Compute effective pool factor based on batch size
             let pool_factor = self.resolve_pool_factor(new_units.len());
@@ -2352,10 +2394,8 @@ impl IndexBuilder {
         };
 
         let encode_batch_size = self.encode_batch_size.unwrap_or(DEFAULT_ENCODE_BATCH_SIZE);
-        let index_chunk_size = self
-            .index_chunk_size
-            .unwrap_or(INDEX_CHUNK_SIZE)
-            .max(encode_batch_size);
+        let index_chunk_size =
+            resolve_index_chunk_size(self.index_chunk_size, encode_batch_size, units);
 
         // Compute effective pool factor based on batch size
         let pool_factor = self.resolve_pool_factor(units.len());
@@ -3755,6 +3795,55 @@ fn prompt_large_index_confirmation(num_units: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_units(count: usize, code_bytes: usize) -> Vec<CodeUnit> {
+        (0..count)
+            .map(|idx| {
+                let mut unit = CodeUnit::new(
+                    format!("unit_{idx}"),
+                    PathBuf::from(format!("src/unit_{idx}.rs")),
+                    1,
+                    1,
+                    Language::Rust,
+                    crate::parser::UnitType::Function,
+                    None,
+                );
+                unit.code = "x".repeat(code_bytes);
+                unit
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_default_index_chunk_size_keeps_short_units_at_historical_default() {
+        let units = synthetic_units(MEDIUM_INDEX_CHUNK_UNITS + 100, 128);
+        assert_eq!(default_index_chunk_size_for_units(&units), INDEX_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn test_default_index_chunk_size_uses_medium_for_medium_real_code() {
+        let units = synthetic_units(MEDIUM_INDEX_CHUNK_UNITS + 100, SHORT_UNIT_AVG_CODE_BYTES);
+        assert_eq!(
+            default_index_chunk_size_for_units(&units),
+            MEDIUM_INDEX_CHUNK_SIZE
+        );
+    }
+
+    #[test]
+    fn test_default_index_chunk_size_uses_large_for_large_real_code() {
+        let units = synthetic_units(LARGE_INDEX_CHUNK_UNITS, SHORT_UNIT_AVG_CODE_BYTES);
+        assert_eq!(
+            default_index_chunk_size_for_units(&units),
+            LARGE_INDEX_CHUNK_SIZE
+        );
+    }
+
+    #[test]
+    fn test_resolve_index_chunk_size_honors_overrides_and_encode_minimum() {
+        let units = synthetic_units(10, 128);
+        assert_eq!(resolve_index_chunk_size(Some(512), 64, &units), 512);
+        assert_eq!(resolve_index_chunk_size(Some(512), 1024, &units), 1024);
+    }
 
     #[test]
     fn test_embedding_provider_requires_plaid_cpu_for_inference_only_backends() {
