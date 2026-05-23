@@ -866,7 +866,14 @@ impl IndexBuilder {
                         .context("Failed to initialize ONNX Runtime")?;
 
                     if !force_cpu_for_small_batch {
-                        if let Some(provider) = preferred_colgrep_gpu_provider() {
+                        // ROCm/MIGraphX is available for explicit --force-gpu,
+                        // but it is currently a poor automatic choice for
+                        // ColGREP indexing: dynamic code-unit shapes trigger
+                        // tens of seconds of cold MIGraphX compilation. Keep
+                        // auto mode on CPU unless another GPU EP is available.
+                        if let Some(provider) = preferred_colgrep_gpu_provider()
+                            .filter(|provider| *provider != ExecutionProvider::MIGraphX)
+                        {
                             (
                                 self.parallel_sessions
                                     .unwrap_or(crate::config::DEFAULT_PARALLEL_SESSIONS_GPU),
@@ -894,10 +901,13 @@ impl IndexBuilder {
             eprintln!("🤖 Model: {}", self.model_id);
             eprintln!("📂 Building index...");
 
-            // Use runtime default for batch size (respects provider availability)
-            let batch = self
-                .batch_size
-                .unwrap_or_else(crate::config::get_default_batch_size);
+            // Use a provider-specific runtime default. MIGraphX intentionally
+            // uses a conservative token budget because it has high cold
+            // compile cost per distinct input shape; explicit --batch-size
+            // still takes precedence for benchmarking/tuning.
+            let batch = self.batch_size.unwrap_or_else(|| {
+                crate::config::default_batch_size_for_execution_provider(execution_provider)
+            });
 
             // Suppress stderr during model loading to hide CoreML's harmless
             // "Context leak detected" warnings on macOS.

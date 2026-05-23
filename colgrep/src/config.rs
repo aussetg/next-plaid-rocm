@@ -6,6 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use next_plaid_onnx::ExecutionProvider;
 use serde::{Deserialize, Serialize};
 
 #[cfg(any(
@@ -32,6 +33,23 @@ pub const DEFAULT_BATCH_SIZE_CPU: usize = 1;
 /// Default batch size per encoding session for GPU inference providers.
 /// With 1 session, larger batch size (64) is optimal for GPU throughput
 pub const DEFAULT_BATCH_SIZE_GPU: usize = 64;
+
+/// Conservative MIGraphX token-budget multiplier for indexing.
+///
+/// MIGraphX currently compiles a new GPU program for each ONNX input shape and
+/// compile time grows steeply with tensor size. Keeping the token budget small
+/// avoids very large cold compiles while preserving explicit ROCm testing.
+pub const DEFAULT_BATCH_SIZE_MIGRAPHX: usize = 1;
+
+pub fn default_batch_size_for_execution_provider(provider: ExecutionProvider) -> usize {
+    match provider {
+        ExecutionProvider::Cpu => DEFAULT_BATCH_SIZE_CPU,
+        ExecutionProvider::MIGraphX => DEFAULT_BATCH_SIZE_MIGRAPHX,
+        provider if provider.is_gpu() => DEFAULT_BATCH_SIZE_GPU,
+        ExecutionProvider::Auto => get_default_batch_size(),
+        _ => DEFAULT_BATCH_SIZE_CPU,
+    }
+}
 
 /// Default batch size - use GPU default when a GPU inference provider is enabled, CPU otherwise.
 /// Note: At compile time we set the GPU default, but at runtime we check provider availability.
@@ -758,6 +776,22 @@ mod tests {
         assert!(config.configured_batch_size().is_none());
         assert!(config.get_parallel_sessions() >= 1);
         assert!(config.get_batch_size() >= 1);
+    }
+
+    #[test]
+    fn test_provider_specific_batch_size_defaults() {
+        assert_eq!(
+            default_batch_size_for_execution_provider(ExecutionProvider::Cpu),
+            DEFAULT_BATCH_SIZE_CPU
+        );
+        assert_eq!(
+            default_batch_size_for_execution_provider(ExecutionProvider::Cuda),
+            DEFAULT_BATCH_SIZE_GPU
+        );
+        assert_eq!(
+            default_batch_size_for_execution_provider(ExecutionProvider::MIGraphX),
+            DEFAULT_BATCH_SIZE_MIGRAPHX
+        );
     }
 
     #[test]
