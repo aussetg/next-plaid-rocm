@@ -2543,6 +2543,154 @@ fn restore_original_input_order(
         .collect()
 }
 
+fn trim_prepared_batch_for_cpu_fallback(
+    prepared: PreparedDocumentBatch,
+) -> Result<PreparedDocumentBatch> {
+    if prepared.batch_size == 0 {
+        return Ok(prepared);
+    }
+
+    let source_rows = prepared.tensor_batch_size;
+    let source_len = prepared.batch_max_len;
+    if source_rows < prepared.batch_size {
+        anyhow::bail!(
+            "prepared batch has {} tensor rows but {} real documents",
+            source_rows,
+            prepared.batch_size
+        );
+    }
+    if prepared.original_lengths.len() != prepared.batch_size {
+        anyhow::bail!(
+            "prepared batch has {} original lengths but {} real documents",
+            prepared.original_lengths.len(),
+            prepared.batch_size
+        );
+    }
+    if prepared.all_token_ids.len() != prepared.batch_size {
+        anyhow::bail!(
+            "prepared batch has {} token-id rows but {} real documents",
+            prepared.all_token_ids.len(),
+            prepared.batch_size
+        );
+    }
+
+    // Document batches prepared for MIGraphX are padded to fixed sequence
+    // lengths such as 128/256/512 so that warm static-shape caches can be
+    // reused. When a shape is cold and we fall back to CPU, those padded tokens
+    // only add CPU work. Trim documents back to the longest real document in
+    // this batch. Query batches keep their full length so query expansion still
+    // returns the configured number of query vectors.
+    let required_len = prepared
+        .original_lengths
+        .iter()
+        .copied()
+        .chain(prepared.all_token_ids.iter().map(Vec::len))
+        .max()
+        .unwrap_or(source_len)
+        .max(1);
+    if required_len > source_len {
+        anyhow::bail!(
+            "prepared batch requires {} tokens but tensor sequence length is {}",
+            required_len,
+            source_len
+        );
+    }
+
+    let target_len = if prepared.is_query {
+        source_len
+    } else {
+        required_len
+    };
+    let target_rows = prepared.batch_size;
+
+    if target_rows == source_rows && target_len == source_len {
+        return Ok(prepared);
+    }
+
+    fn trim_matrix(
+        data: Vec<i64>,
+        source_rows: usize,
+        source_len: usize,
+        target_rows: usize,
+        target_len: usize,
+        name: &str,
+    ) -> Result<Vec<i64>> {
+        let expected = source_rows.checked_mul(source_len).ok_or_else(|| {
+            anyhow::anyhow!("{name} source shape [{source_rows},{source_len}] overflows")
+        })?;
+        if data.len() != expected {
+            anyhow::bail!(
+                "{name} length {} does not match source shape [{},{}]",
+                data.len(),
+                source_rows,
+                source_len
+            );
+        }
+
+        let target_elements = target_rows.checked_mul(target_len).ok_or_else(|| {
+            anyhow::anyhow!("{name} target shape [{target_rows},{target_len}] overflows")
+        })?;
+        let mut trimmed = Vec::with_capacity(target_elements);
+        for row in 0..target_rows {
+            let row_start = row * source_len;
+            trimmed.extend_from_slice(&data[row_start..row_start + target_len]);
+        }
+        Ok(trimmed)
+    }
+
+    let all_input_ids = trim_matrix(
+        prepared.all_input_ids,
+        source_rows,
+        source_len,
+        target_rows,
+        target_len,
+        "input_ids",
+    )?;
+    let all_attention_mask = trim_matrix(
+        prepared.all_attention_mask,
+        source_rows,
+        source_len,
+        target_rows,
+        target_len,
+        "attention_mask",
+    )?;
+    let all_token_type_ids = prepared
+        .all_token_type_ids
+        .map(|ids| {
+            trim_matrix(
+                ids,
+                source_rows,
+                source_len,
+                target_rows,
+                target_len,
+                "token_type_ids",
+            )
+        })
+        .transpose()?;
+
+    onnx_diag!(
+        "MIGraphX CPU fallback trimmed prepared batch shape=[{},{}] -> [{},{}]",
+        source_rows,
+        source_len,
+        target_rows,
+        target_len
+    );
+
+    Ok(PreparedDocumentBatch {
+        batch_size: prepared.batch_size,
+        tensor_batch_size: target_rows,
+        batch_max_len: target_len,
+        all_input_ids,
+        all_attention_mask,
+        all_token_type_ids,
+        all_token_ids: prepared.all_token_ids,
+        original_lengths: prepared.original_lengths,
+        is_query: prepared.is_query,
+        filter_skiplist: prepared.filter_skiplist,
+        original_input_indices: prepared.original_input_indices,
+    })
+}
+
 impl MigraphxHybrid {
     fn new(
         model_dir: PathBuf,
@@ -2803,14 +2951,17 @@ impl MigraphxHybrid {
                         "MIGraphX warm shape {:?} failed validation/run, falling back to CPU: {err:#}",
                         shape
                     );
-                    return self.cpu_model()?.encode_prepared_documents(cpu_fallback);
+                    return self.cpu_model()?.encode_prepared_documents(
+                        trim_prepared_batch_for_cpu_fallback(cpu_fallback)?,
+                    );
                 }
             }
         }
 
         self.maybe_warm_shape(shape)?;
         onnx_diag!("MIGraphX hybrid CPU fallback for cold shape {:?}", shape);
-        self.cpu_model()?.encode_prepared_documents(prepared)
+        self.cpu_model()?
+            .encode_prepared_documents(trim_prepared_batch_for_cpu_fallback(prepared)?)
     }
 
     fn encode_prepared_document_batches(
@@ -2877,8 +3028,8 @@ impl MigraphxHybrid {
                 .collect();
             let batches = cpu_batches
                 .into_iter()
-                .map(|(_, batch)| batch)
-                .collect::<Vec<_>>();
+                .map(|(_, batch)| trim_prepared_batch_for_cpu_fallback(batch))
+                .collect::<Result<Vec<_>>>()?;
             let cpu_model = self.cpu_model()?;
             let cpu_encoded = cpu_model.encode_prepared_batches_unordered(batches)?;
             let mut iter = cpu_encoded.into_iter();
@@ -3832,6 +3983,74 @@ mod tests {
         let error = require_gpu_execution_provider().unwrap_err().to_string();
         assert!(error.contains("GPU execution requested"));
         assert!(error.contains("no GPU execution provider was compiled"));
+    }
+
+    // =========================================================================
+    // MIGraphX CPU fallback tests
+    // =========================================================================
+
+    #[test]
+    fn test_trim_prepared_batch_for_cpu_fallback_removes_padding() {
+        let prepared = PreparedDocumentBatch {
+            batch_size: 2,
+            tensor_batch_size: 4,
+            batch_max_len: 8,
+            all_input_ids: (0..32).collect(),
+            all_attention_mask: (100..132).collect(),
+            all_token_type_ids: Some((200..232).collect()),
+            all_token_ids: vec![vec![1, 2, 3], vec![4, 5, 6, 7, 8]],
+            original_lengths: vec![3, 5],
+            is_query: false,
+            filter_skiplist: true,
+            original_input_indices: vec![1, 0],
+        };
+
+        let trimmed = trim_prepared_batch_for_cpu_fallback(prepared).unwrap();
+
+        assert_eq!(trimmed.batch_size, 2);
+        assert_eq!(trimmed.tensor_batch_size, 2);
+        assert_eq!(trimmed.batch_max_len, 5);
+        assert_eq!(trimmed.all_input_ids, vec![0, 1, 2, 3, 4, 8, 9, 10, 11, 12]);
+        assert_eq!(
+            trimmed.all_attention_mask,
+            vec![100, 101, 102, 103, 104, 108, 109, 110, 111, 112]
+        );
+        assert_eq!(
+            trimmed.all_token_type_ids,
+            Some(vec![200, 201, 202, 203, 204, 208, 209, 210, 211, 212])
+        );
+        assert_eq!(
+            trimmed.all_token_ids,
+            vec![vec![1, 2, 3], vec![4, 5, 6, 7, 8]]
+        );
+        assert_eq!(trimmed.original_lengths, vec![3, 5]);
+        assert_eq!(trimmed.original_input_indices, vec![1, 0]);
+    }
+
+    #[test]
+    fn test_trim_prepared_batch_for_cpu_fallback_preserves_query_length() {
+        let prepared = PreparedDocumentBatch {
+            batch_size: 1,
+            tensor_batch_size: 4,
+            batch_max_len: 6,
+            all_input_ids: (0..24).collect(),
+            all_attention_mask: vec![1; 24],
+            all_token_type_ids: None,
+            all_token_ids: vec![vec![1, 2, 3]],
+            original_lengths: vec![3],
+            is_query: true,
+            filter_skiplist: false,
+            original_input_indices: Vec::new(),
+        };
+
+        let trimmed = trim_prepared_batch_for_cpu_fallback(prepared).unwrap();
+
+        assert_eq!(trimmed.batch_size, 1);
+        assert_eq!(trimmed.tensor_batch_size, 1);
+        assert_eq!(trimmed.batch_max_len, 6);
+        assert_eq!(trimmed.all_input_ids, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(trimmed.all_attention_mask, vec![1; 6]);
+        assert_eq!(trimmed.all_token_type_ids, None);
     }
 
     // =========================================================================
