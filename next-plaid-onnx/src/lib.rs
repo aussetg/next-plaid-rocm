@@ -250,23 +250,29 @@ const GPU_PROVIDER_ORDER: [ExecutionProvider; 5] = [
     ExecutionProvider::MIGraphX,
 ];
 
+/// Whether this crate was compiled with support for a given execution provider.
+///
+/// CPU and `Auto` do not require a feature-gated provider, so they always
+/// return `true`. GPU providers only return `true` when their corresponding
+/// Cargo feature is enabled.
+pub fn is_execution_provider_compiled(provider: ExecutionProvider) -> bool {
+    match provider {
+        ExecutionProvider::Auto | ExecutionProvider::Cpu => true,
+        ExecutionProvider::Cuda => cfg!(feature = "cuda"),
+        ExecutionProvider::TensorRT => cfg!(feature = "tensorrt"),
+        ExecutionProvider::CoreML => cfg!(feature = "coreml"),
+        ExecutionProvider::DirectML => cfg!(feature = "directml"),
+        ExecutionProvider::MIGraphX => cfg!(feature = "migraphx"),
+    }
+}
+
 /// GPU execution providers compiled into this crate, in auto-selection order.
 pub fn compiled_gpu_execution_providers() -> Vec<ExecutionProvider> {
-    #[allow(unused_mut)]
-    let mut providers = Vec::new();
-
-    #[cfg(feature = "cuda")]
-    providers.push(ExecutionProvider::Cuda);
-    #[cfg(feature = "tensorrt")]
-    providers.push(ExecutionProvider::TensorRT);
-    #[cfg(feature = "coreml")]
-    providers.push(ExecutionProvider::CoreML);
-    #[cfg(feature = "directml")]
-    providers.push(ExecutionProvider::DirectML);
-    #[cfg(feature = "migraphx")]
-    providers.push(ExecutionProvider::MIGraphX);
-
-    providers
+    GPU_PROVIDER_ORDER
+        .iter()
+        .copied()
+        .filter(|provider| is_execution_provider_compiled(*provider))
+        .collect()
 }
 
 /// First compiled GPU execution provider in auto-selection order.
@@ -276,7 +282,26 @@ pub fn compiled_gpu_execution_provider() -> Option<ExecutionProvider> {
 
 /// Return whether a specific execution provider is available in the currently
 /// loaded ONNX Runtime library.
+///
+/// For `ExecutionProvider::Auto`, this returns whether any compiled GPU
+/// provider is available. CPU fallback is intentionally not counted as an
+/// available accelerator.
 pub fn is_execution_provider_available(provider: ExecutionProvider) -> bool {
+    if !is_execution_provider_compiled(provider) {
+        return false;
+    }
+
+    if (matches!(provider, ExecutionProvider::Auto) || provider.is_gpu()) && is_force_cpu() {
+        return false;
+    }
+
+    let needs_provider_probe = provider.is_gpu()
+        || (matches!(provider, ExecutionProvider::Auto)
+            && !compiled_gpu_execution_providers().is_empty());
+    if needs_provider_probe {
+        init_ort_runtime();
+    }
+
     match provider {
         ExecutionProvider::Auto => preferred_gpu_execution_provider().is_some(),
         ExecutionProvider::Cpu => true,
@@ -305,6 +330,36 @@ pub fn preferred_gpu_execution_provider() -> Option<ExecutionProvider> {
 /// Whether any compiled GPU execution provider is available.
 pub fn is_gpu_available() -> bool {
     preferred_gpu_execution_provider().is_some()
+}
+
+fn execution_provider_list_display(providers: &[ExecutionProvider]) -> String {
+    providers
+        .iter()
+        .map(|provider| provider.display_name())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn unavailable_gpu_execution_provider_reason() -> String {
+    let compiled = compiled_gpu_execution_providers();
+    if compiled.is_empty() {
+        "no GPU execution provider was compiled. Enable a feature such as 'cuda', 'rocm'/'migraphx', 'coreml', or 'directml'.".to_string()
+    } else {
+        let names = execution_provider_list_display(&compiled);
+        format!(
+            "no compiled GPU execution provider is available in the loaded ONNX Runtime library. Compiled provider(s): {names}."
+        )
+    }
+}
+
+/// Return the preferred available GPU execution provider or a user-facing error.
+pub fn require_gpu_execution_provider() -> Result<ExecutionProvider> {
+    preferred_gpu_execution_provider().ok_or_else(|| {
+        anyhow::anyhow!(
+            "GPU execution requested, but {}",
+            unavailable_gpu_execution_provider_reason()
+        )
+    })
 }
 
 fn configure_execution_provider(
@@ -491,21 +546,10 @@ pub fn is_migraphx_available() -> bool {
 fn configure_auto_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
     if is_force_gpu() {
         let provider = preferred_gpu_execution_provider().ok_or_else(|| {
-            let compiled = compiled_gpu_execution_providers();
-            if compiled.is_empty() {
-                anyhow::anyhow!(
-                    "NEXT_PLAID_FORCE_GPU is set, but no GPU execution provider was compiled. Enable a feature such as 'cuda', 'rocm'/'migraphx', 'coreml', or 'directml'."
-                )
-            } else {
-                let names = compiled
-                    .iter()
-                    .map(|provider| provider.display_name())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                anyhow::anyhow!(
-                    "NEXT_PLAID_FORCE_GPU is set, but no compiled GPU execution provider is available in the loaded ONNX Runtime library. Compiled provider(s): {names}."
-                )
-            }
+            anyhow::anyhow!(
+                "NEXT_PLAID_FORCE_GPU is set, but {}",
+                unavailable_gpu_execution_provider_reason()
+            )
         })?;
         return configure_execution_provider(builder, provider);
     }
@@ -2586,6 +2630,7 @@ mod tests {
         assert_ne!(ExecutionProvider::Cuda, ExecutionProvider::TensorRT);
         assert_ne!(ExecutionProvider::TensorRT, ExecutionProvider::CoreML);
         assert_ne!(ExecutionProvider::CoreML, ExecutionProvider::DirectML);
+        assert_ne!(ExecutionProvider::DirectML, ExecutionProvider::MIGraphX);
     }
 
     #[test]
@@ -2600,6 +2645,80 @@ mod tests {
         let provider = ExecutionProvider::Cuda;
         let debug_str = format!("{:?}", provider);
         assert_eq!(debug_str, "Cuda");
+    }
+
+    #[test]
+    fn test_execution_provider_display_names() {
+        assert_eq!(ExecutionProvider::Auto.display_name(), "auto");
+        assert_eq!(ExecutionProvider::Cpu.display_name(), "CPU");
+        assert_eq!(ExecutionProvider::Cuda.display_name(), "CUDA");
+        assert_eq!(ExecutionProvider::TensorRT.display_name(), "TensorRT");
+        assert_eq!(ExecutionProvider::CoreML.display_name(), "CoreML");
+        assert_eq!(ExecutionProvider::DirectML.display_name(), "DirectML");
+        assert_eq!(ExecutionProvider::MIGraphX.display_name(), "MIGraphX/ROCm");
+    }
+
+    #[test]
+    fn test_execution_provider_gpu_classification() {
+        assert!(!ExecutionProvider::Auto.is_gpu());
+        assert!(!ExecutionProvider::Cpu.is_gpu());
+        assert!(ExecutionProvider::Cuda.is_gpu());
+        assert!(ExecutionProvider::TensorRT.is_gpu());
+        assert!(ExecutionProvider::CoreML.is_gpu());
+        assert!(ExecutionProvider::DirectML.is_gpu());
+        assert!(ExecutionProvider::MIGraphX.is_gpu());
+    }
+
+    #[test]
+    fn test_execution_provider_compiled_flags() {
+        assert!(is_execution_provider_compiled(ExecutionProvider::Auto));
+        assert!(is_execution_provider_compiled(ExecutionProvider::Cpu));
+        assert_eq!(
+            is_execution_provider_compiled(ExecutionProvider::Cuda),
+            cfg!(feature = "cuda")
+        );
+        assert_eq!(
+            is_execution_provider_compiled(ExecutionProvider::TensorRT),
+            cfg!(feature = "tensorrt")
+        );
+        assert_eq!(
+            is_execution_provider_compiled(ExecutionProvider::CoreML),
+            cfg!(feature = "coreml")
+        );
+        assert_eq!(
+            is_execution_provider_compiled(ExecutionProvider::DirectML),
+            cfg!(feature = "directml")
+        );
+        assert_eq!(
+            is_execution_provider_compiled(ExecutionProvider::MIGraphX),
+            cfg!(feature = "migraphx")
+        );
+    }
+
+    #[test]
+    fn test_compiled_gpu_execution_provider_order() {
+        let expected = GPU_PROVIDER_ORDER
+            .iter()
+            .copied()
+            .filter(|provider| is_execution_provider_compiled(*provider))
+            .collect::<Vec<_>>();
+
+        assert_eq!(compiled_gpu_execution_providers(), expected);
+        assert_eq!(compiled_gpu_execution_provider(), expected.first().copied());
+    }
+
+    #[test]
+    #[cfg(not(any(
+        feature = "cuda",
+        feature = "tensorrt",
+        feature = "coreml",
+        feature = "directml",
+        feature = "migraphx"
+    )))]
+    fn test_require_gpu_execution_provider_without_gpu_features() {
+        let error = require_gpu_execution_provider().unwrap_err().to_string();
+        assert!(error.contains("GPU execution requested"));
+        assert!(error.contains("no GPU execution provider was compiled"));
     }
 
     // =========================================================================
