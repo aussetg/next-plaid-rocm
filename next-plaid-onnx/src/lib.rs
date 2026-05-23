@@ -57,7 +57,7 @@ use ort::value::Tensor;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -65,6 +65,7 @@ use std::sync::mpsc;
 use std::sync::Once;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::Instant;
 use tokenizers::Encoding;
 use tokenizers::Tokenizer;
 
@@ -115,6 +116,62 @@ use ort::execution_providers::TensorRTExecutionProvider;
 use ort::ortsys;
 
 use ort::session::builder::SessionBuilder;
+
+fn diagnostics_enabled() -> bool {
+    std::env::var("NEXT_PLAID_ONNX_DIAG")
+        .map(|value| {
+            let value = value.trim();
+            !(value.is_empty()
+                || value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off"))
+        })
+        .unwrap_or(false)
+}
+
+macro_rules! onnx_diag {
+    ($($arg:tt)*) => {
+        if crate::diagnostics_enabled() {
+            eprintln!("[next-plaid-onnx:diag] {}", format_args!($($arg)*));
+        }
+    };
+}
+
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
+#[cfg(feature = "migraphx")]
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            let value = value.trim();
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
+fn prepared_batch_summary(batches: &[PreparedDocumentBatch]) -> String {
+    let docs: usize = batches.iter().map(|batch| batch.batch_size).sum();
+    let tensor_rows: usize = batches.iter().map(|batch| batch.tensor_batch_size).sum();
+    let mut shapes: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+    for batch in batches {
+        *shapes
+            .entry((batch.tensor_batch_size, batch.batch_max_len))
+            .or_default() += 1;
+    }
+
+    let shape_summary = shapes
+        .into_iter()
+        .map(|((batch, len), count)| format!("{count}×[{batch},{len}]"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "docs={docs} tensor_rows={tensor_rows} batches={} shapes=[{shape_summary}]",
+        batches.len()
+    )
+}
 
 // =============================================================================
 // ONNX Runtime initialization (internal)
@@ -717,8 +774,30 @@ fn append_migraphx_execution_provider(builder: &mut SessionBuilder) -> ort::Resu
     // to an invalid directory. Supplying only explicit non-default options via
     // the map leaves MIGraphX's cache path truly empty.
     let provider_name = std::ffi::CString::new("MIGraphXExecutionProvider").unwrap();
-    let keys = [std::ffi::CString::new("device_id").unwrap()];
-    let values = [std::ffi::CString::new("0").unwrap()];
+    let mut options = vec![("device_id".to_string(), "0".to_string())];
+
+    if env_flag_enabled("NEXT_PLAID_MIGRAPHX_FP16") {
+        options.push(("migraphx_fp16_enable".to_string(), "1".to_string()));
+    }
+    if let Ok(path) = std::env::var("NEXT_PLAID_MIGRAPHX_MODEL_CACHE_DIR") {
+        if !path.trim().is_empty() {
+            options.push(("migraphx_model_cache_dir".to_string(), path));
+        }
+    }
+
+    onnx_diag!(
+        "MIGraphX provider options keys={:?}",
+        options.iter().map(|(key, _)| key).collect::<Vec<_>>()
+    );
+
+    let keys = options
+        .iter()
+        .map(|(key, _)| std::ffi::CString::new(key.as_str()).unwrap())
+        .collect::<Vec<_>>();
+    let values = options
+        .iter()
+        .map(|(_, value)| std::ffi::CString::new(value.as_str()).unwrap())
+        .collect::<Vec<_>>();
     let key_ptrs = keys.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
     let value_ptrs = values.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
 
@@ -929,7 +1008,11 @@ pub struct Colbert {
 }
 
 pub struct PreparedDocumentBatch {
+    /// Number of real documents/chunks in this prepared batch.
     batch_size: usize,
+    /// Number of rows in the ONNX tensors. Shape-sensitive execution
+    /// providers may pad this above `batch_size` to reuse compiled plans.
+    tensor_batch_size: usize,
     batch_max_len: usize,
     all_input_ids: Vec<i64>,
     all_attention_mask: Vec<i64>,
@@ -955,6 +1038,10 @@ struct TokenizedDocument {
 impl PreparedDocumentBatch {
     pub fn batch_size(&self) -> usize {
         self.batch_size
+    }
+
+    pub fn tensor_batch_size(&self) -> usize {
+        self.tensor_batch_size
     }
 
     pub fn batch_max_len(&self) -> usize {
@@ -1168,9 +1255,26 @@ impl ColbertBuilder {
 
     /// Build the Colbert model.
     pub fn build(self) -> Result<Colbert> {
+        let build_start = Instant::now();
+        onnx_diag!(
+            "build start model_dir={} provider={} quantized={} sessions={} threads_per_session={} batch_size={:?} dynamic_batch={} query_length={:?} document_length={:?}",
+            self.model_dir.display(),
+            self.execution_provider.display_name(),
+            self.quantized,
+            self.num_sessions,
+            self.threads_per_session,
+            self.batch_size,
+            self.dynamic_batch,
+            self.query_length,
+            self.document_length
+        );
+
+        let init_start = Instant::now();
         init_ort_runtime();
+        onnx_diag!("ort init done ms={:.3}", elapsed_ms(init_start));
 
         let model_dir = &self.model_dir;
+        let load_start = Instant::now();
         let onnx_path = select_onnx_file(model_dir, self.quantized)?;
         let tokenizer_path = model_dir.join("tokenizer.json");
 
@@ -1191,6 +1295,15 @@ impl ColbertBuilder {
 
         update_token_ids(&mut config, &tokenizer);
         let skiplist_ids = build_skiplist(&config, &tokenizer);
+        onnx_diag!(
+            "model metadata loaded ms={:.3} onnx={} query_length={} document_length={} embedding_dim={} uses_token_type_ids={}",
+            elapsed_ms(load_start),
+            onnx_path.display(),
+            config.query_length,
+            config.document_length,
+            config.embedding_dim,
+            config.uses_token_type_ids
+        );
 
         let gpu_execution_requested = match self.execution_provider {
             ExecutionProvider::Auto => preferred_gpu_execution_provider().is_some(),
@@ -1207,7 +1320,8 @@ impl ColbertBuilder {
         };
 
         let mut sessions = Vec::with_capacity(self.num_sessions);
-        for _i in 0..self.num_sessions {
+        for i in 0..self.num_sessions {
+            let session_start = Instant::now();
             let builder = Session::builder()
                 .map_err(|e| anyhow::anyhow!("Failed to create ONNX session builder: {e:?}"))?
                 .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -1226,9 +1340,20 @@ impl ColbertBuilder {
 
             let builder = configure_execution_provider(builder, self.execution_provider)?;
 
+            let commit_start = Instant::now();
+            onnx_diag!(
+                "session {i} commit start provider={} onnx={}",
+                self.execution_provider.display_name(),
+                onnx_path.display()
+            );
             let session = builder
                 .commit_from_file(&onnx_path)
                 .context("Failed to load ONNX model")?;
+            onnx_diag!(
+                "session {i} commit done commit_ms={:.3} session_total_ms={:.3}",
+                elapsed_ms(commit_start),
+                elapsed_ms(session_start)
+            );
 
             sessions.push(Arc::new(Mutex::new(session)));
         }
@@ -1241,6 +1366,12 @@ impl ColbertBuilder {
         } else {
             DEFAULT_CPU_BATCH_SIZE
         });
+        onnx_diag!(
+            "build done total_ms={:.3} effective_batch_size={} gpu_execution_requested={}",
+            elapsed_ms(build_start),
+            batch_size,
+            gpu_execution_requested
+        );
 
         Ok(Colbert {
             sessions,
@@ -1338,8 +1469,23 @@ impl Colbert {
             return Ok(Vec::new());
         }
 
+        let total_start = Instant::now();
+        onnx_diag!(
+            "tokenize_documents start docs={} batch_size={} dynamic_batch={} requested_provider={}",
+            documents.len(),
+            self.batch_size,
+            self.dynamic_batch,
+            self.requested_execution_provider.display_name()
+        );
+
+        let tokenize_start = Instant::now();
         let processed_texts = preprocess_texts(&self.config, documents);
         let tokenized = tokenize_processed_texts_individually(&self.tokenizer, &processed_texts)?;
+        onnx_diag!(
+            "tokenize_documents tokenized docs={} ms={:.3}",
+            tokenized.len(),
+            elapsed_ms(tokenize_start)
+        );
         let truncate_limit = self.config.document_length.saturating_sub(1);
         let use_gpu_batch_modes = match self.requested_execution_provider {
             ExecutionProvider::Auto => is_gpu_available(),
@@ -1371,16 +1517,24 @@ impl Colbert {
                     false,
                     true,
                     piece_indices,
+                    None,
                 )?);
             }
 
+            onnx_diag!(
+                "tokenize_documents done mode=fixed total_ms={:.3} {}",
+                elapsed_ms(total_start),
+                prepared_batch_summary(&batches)
+            );
             return Ok(batches);
         }
 
         // GPU path: token-budget dynamic batching. Documents are sorted by
-        // length and bucketed into fixed shapes (quantized to 32-token steps).
-        // This lets the GPU reuse execution plans across batches with the same
-        // shape, reducing kernel launch overhead and minimizing padding waste.
+        // length and bucketed into planned sequence lengths. Shape-sensitive
+        // execution providers (currently MIGraphX) pad tensors to those
+        // planned sequence lengths so compiled execution plans can be reused.
+        // Other providers keep the historical exact per-batch tensor sizes to
+        // avoid changing their padding/throughput behavior.
         // We carry the original input index alongside each tokenized doc so
         // `encode_prepared_document_batches` can restore the caller-visible
         // input order in the returned embeddings.
@@ -1398,6 +1552,8 @@ impl Colbert {
 
         let shapes =
             build_fixed_dynamic_shapes(self.batch_size.max(1), self.config.document_length);
+        let pad_to_planned_sequence_len =
+            execution_provider_prefers_planned_sequence_lengths(self.requested_execution_provider);
         let mut buckets: Vec<Vec<(usize, TokenizedDocument)>> =
             (0..shapes.len()).map(|_| Vec::new()).collect();
 
@@ -1422,6 +1578,15 @@ impl Colbert {
                     piece_encodings.push(encoding);
                     piece_indices.push(idx);
                 }
+                // For MIGraphX we must avoid per-batch sequence lengths like
+                // 255/505/1008, because each distinct tensor shape triggers a
+                // new compile/cache entry. Keep the real row count, though:
+                // padding a small/final short-doc batch up to `shape.docs`
+                // can turn one real document into a 1024-row tensor.
+                let planned_shape = pad_to_planned_sequence_len.then_some(FixedDynamicShape {
+                    docs: piece_encodings.len(),
+                    planned_len: shape.planned_len,
+                });
                 batches.push(prepare_batch_from_tokenized_documents(
                     &self.tokenizer,
                     &self.config,
@@ -1429,10 +1594,16 @@ impl Colbert {
                     false,
                     true,
                     piece_indices,
+                    planned_shape,
                 )?);
             }
         }
 
+        onnx_diag!(
+            "tokenize_documents done mode=dynamic total_ms={:.3} {}",
+            elapsed_ms(total_start),
+            prepared_batch_summary(&batches)
+        );
         Ok(batches)
     }
 
@@ -1453,6 +1624,13 @@ impl Colbert {
         if prepared_batches.is_empty() {
             return Ok(Vec::new());
         }
+
+        let total_start = Instant::now();
+        onnx_diag!(
+            "encode_prepared_document_batches start {} sessions={}",
+            prepared_batch_summary(&prepared_batches),
+            self.sessions.len()
+        );
 
         // Collect the original-input position for every document across all
         // batches in the order they appear here. When `tokenize_documents_in_batches`
@@ -1509,6 +1687,12 @@ impl Colbert {
             }
             all_embeddings
         };
+
+        onnx_diag!(
+            "encode_prepared_document_batches encoded embeddings={} total_ms={:.3}",
+            encoded.len(),
+            elapsed_ms(total_start)
+        );
 
         if !has_reordering || combined_indices.len() != encoded.len() {
             return Ok(encoded);
@@ -1916,6 +2100,16 @@ struct FixedDynamicShape {
     planned_len: usize,
 }
 
+fn execution_provider_prefers_planned_sequence_lengths(provider: ExecutionProvider) -> bool {
+    match provider {
+        ExecutionProvider::MIGraphX => true,
+        ExecutionProvider::Auto => {
+            preferred_gpu_execution_provider() == Some(ExecutionProvider::MIGraphX)
+        }
+        _ => false,
+    }
+}
+
 fn build_fixed_dynamic_shapes(batch_size: usize, document_length: usize) -> Vec<FixedDynamicShape> {
     let total_budget = batch_size.max(1).saturating_mul(document_length.max(1));
     let mut shapes = Vec::new();
@@ -2009,6 +2203,7 @@ fn prepare_batch_for_session(
     if texts.is_empty() {
         return Ok(PreparedDocumentBatch {
             batch_size: 0,
+            tensor_batch_size: 0,
             batch_max_len: 0,
             all_input_ids: Vec::new(),
             all_attention_mask: Vec::new(),
@@ -2044,6 +2239,7 @@ fn prepare_batch_from_tokenized_documents(
     is_query: bool,
     filter_skiplist: bool,
     original_input_indices: Vec<usize>,
+    planned_shape: Option<FixedDynamicShape>,
 ) -> Result<PreparedDocumentBatch> {
     let (prefix_str, prefix_token_id_opt, max_length) = if is_query {
         (
@@ -2084,6 +2280,25 @@ fn prepare_batch_from_tokenized_documents(
     }
 
     let batch_size = batch_docs.len();
+    let (tensor_batch_size, batch_max_len) = if let Some(shape) = planned_shape {
+        if shape.docs < batch_size {
+            anyhow::bail!(
+                "planned batch shape has {} rows but batch contains {} documents",
+                shape.docs,
+                batch_size
+            );
+        }
+        if shape.planned_len < batch_max_len {
+            anyhow::bail!(
+                "planned batch shape has sequence length {} but batch requires {} tokens",
+                shape.planned_len,
+                batch_max_len
+            );
+        }
+        (shape.docs, shape.planned_len)
+    } else {
+        (batch_size, batch_max_len)
+    };
     let default_input_id = if is_query && config.do_query_expansion {
         config.mask_token_id as i64
     } else {
@@ -2094,9 +2309,10 @@ fn prepare_batch_from_tokenized_documents(
     } else {
         0i64
     };
-    let mut all_input_ids: Vec<i64> = vec![default_input_id; batch_size * batch_max_len];
-    let mut all_attention_mask: Vec<i64> = vec![default_attention; batch_size * batch_max_len];
-    let mut all_token_type_ids: Vec<i64> = vec![0; batch_size * batch_max_len];
+    let mut all_input_ids: Vec<i64> = vec![default_input_id; tensor_batch_size * batch_max_len];
+    let mut all_attention_mask: Vec<i64> =
+        vec![default_attention; tensor_batch_size * batch_max_len];
+    let mut all_token_type_ids: Vec<i64> = vec![0; tensor_batch_size * batch_max_len];
     let mut all_token_ids: Vec<Vec<u32>> = Vec::with_capacity(batch_size);
     let mut original_lengths: Vec<usize> = Vec::with_capacity(batch_size);
 
@@ -2145,6 +2361,7 @@ fn prepare_batch_from_tokenized_documents(
 
     Ok(PreparedDocumentBatch {
         batch_size,
+        tensor_batch_size,
         batch_max_len,
         all_input_ids,
         all_attention_mask,
@@ -2223,6 +2440,7 @@ fn prepare_batch_from_tokenizer_encodings(
     }
 
     let batch_size = batch_encodings.len();
+    let tensor_batch_size = batch_size;
     let default_input_id = if is_query && config.do_query_expansion {
         config.mask_token_id as i64
     } else {
@@ -2289,6 +2507,7 @@ fn prepare_batch_from_tokenizer_encodings(
 
     Ok(PreparedDocumentBatch {
         batch_size,
+        tensor_batch_size,
         batch_max_len,
         all_input_ids,
         all_attention_mask,
@@ -2314,8 +2533,10 @@ fn encode_prepared_batch_with_session(
     skiplist_ids: &HashSet<u32>,
     prepared: PreparedDocumentBatch,
 ) -> Result<Vec<Array2<f32>>> {
+    let total_start = Instant::now();
     let PreparedDocumentBatch {
         batch_size,
+        tensor_batch_size,
         batch_max_len,
         all_input_ids,
         all_attention_mask,
@@ -2331,14 +2552,27 @@ fn encode_prepared_batch_with_session(
         return Ok(Vec::new());
     }
 
-    let input_ids_tensor = Tensor::from_array(([batch_size, batch_max_len], all_input_ids))?;
+    let tensor_start = Instant::now();
+    let input_ids_tensor = Tensor::from_array(([tensor_batch_size, batch_max_len], all_input_ids))?;
     let attention_mask_tensor =
-        Tensor::from_array(([batch_size, batch_max_len], all_attention_mask))?;
+        Tensor::from_array(([tensor_batch_size, batch_max_len], all_attention_mask))?;
 
     let token_type_ids_tensor = all_token_type_ids
-        .map(|ids| Tensor::from_array(([batch_size, batch_max_len], ids)))
+        .map(|ids| Tensor::from_array(([tensor_batch_size, batch_max_len], ids)))
         .transpose()?;
+    let tensor_ms = elapsed_ms(tensor_start);
+    let has_token_type_ids = token_type_ids_tensor.is_some();
 
+    onnx_diag!(
+        "session.run start shape=[{},{}] is_query={} filter_skiplist={} token_type_ids={} tensor_ms={:.3}",
+        tensor_batch_size,
+        batch_max_len,
+        is_query,
+        filter_skiplist,
+        has_token_type_ids,
+        tensor_ms
+    );
+    let run_start = Instant::now();
     let (shape_slice, output_owned): (Vec<i64>, Vec<f32>) =
         if let Some(token_type_ids_tensor) = token_type_ids_tensor {
             let outputs = session.run(ort::inputs![
@@ -2360,8 +2594,37 @@ fn encode_prepared_batch_with_session(
                 .context("Failed to extract output tensor")?;
             (output_shape.to_vec(), output_data.to_vec())
         };
+    let run_ms = elapsed_ms(run_start);
+    onnx_diag!(
+        "session.run done shape=[{},{}] output_shape={:?} run_extract_ms={:.3}",
+        tensor_batch_size,
+        batch_max_len,
+        shape_slice,
+        run_ms
+    );
 
-    let embedding_dim = shape_slice[2] as usize;
+    let postprocess_start = Instant::now();
+    if shape_slice.len() != 3 {
+        anyhow::bail!(
+            "ONNX output tensor has rank {} but expected rank 3 for input shape [{},{}]",
+            shape_slice.len(),
+            tensor_batch_size,
+            batch_max_len
+        );
+    }
+    let output_batch_size =
+        usize::try_from(shape_slice[0]).context("Negative output batch size")?;
+    let output_sequence_len =
+        usize::try_from(shape_slice[1]).context("Negative output sequence length")?;
+    let embedding_dim = usize::try_from(shape_slice[2]).context("Negative embedding dimension")?;
+    if output_batch_size != tensor_batch_size || output_sequence_len != batch_max_len {
+        anyhow::bail!(
+            "ONNX output shape {:?} does not match input shape [{},{}]. Clear any stale execution-provider model cache and retry.",
+            shape_slice,
+            tensor_batch_size,
+            batch_max_len
+        );
+    }
     let output_data = &output_owned;
 
     let mut all_embeddings = Vec::with_capacity(batch_size);
@@ -2398,6 +2661,15 @@ fn encode_prepared_batch_with_session(
             all_embeddings.push(arr);
         }
     }
+
+    onnx_diag!(
+        "encode_prepared_batch done shape=[{},{}] embeddings={} postprocess_ms={:.3} total_ms={:.3}",
+        tensor_batch_size,
+        batch_max_len,
+        all_embeddings.len(),
+        elapsed_ms(postprocess_start),
+        elapsed_ms(total_start)
+    );
 
     Ok(all_embeddings)
 }
