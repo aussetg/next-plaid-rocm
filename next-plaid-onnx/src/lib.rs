@@ -2373,6 +2373,44 @@ fn planned_tensor_rows_for_provider(
     }
 }
 
+fn migraphx_warm_tail_row_padding_enabled() -> bool {
+    std::env::var("NEXT_PLAID_MIGRAPHX_PAD_WARM_TAIL_ROWS")
+        .map(|value| {
+            let value = value.trim();
+            !(value.is_empty()
+                || value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("no"))
+        })
+        .unwrap_or(true)
+}
+
+fn migraphx_warm_tail_max_row_padding_factor() -> usize {
+    migraphx_env_usize("NEXT_PLAID_MIGRAPHX_TAIL_MAX_ROW_PADDING_FACTOR")
+        .or_else(|| migraphx_env_usize("NEXT_PLAID_MIGRAPHX_MAX_ROW_PADDING_FACTOR"))
+        .unwrap_or(2)
+        .max(1)
+}
+
+fn can_pad_migraphx_warm_tail_rows(real_rows: usize, planned_rows: usize) -> bool {
+    can_pad_migraphx_warm_tail_rows_with_factor(
+        real_rows,
+        planned_rows,
+        migraphx_warm_tail_max_row_padding_factor(),
+    )
+}
+
+fn can_pad_migraphx_warm_tail_rows_with_factor(
+    real_rows: usize,
+    planned_rows: usize,
+    max_factor: usize,
+) -> bool {
+    real_rows > 0
+        && planned_rows > real_rows
+        && planned_rows <= real_rows.saturating_mul(max_factor.max(1))
+}
+
 fn build_fixed_dynamic_shapes(batch_size: usize, document_length: usize) -> Vec<FixedDynamicShape> {
     let total_budget = batch_size.max(1).saturating_mul(document_length.max(1));
     let mut shapes = Vec::new();
@@ -2691,6 +2729,112 @@ fn trim_prepared_batch_for_cpu_fallback(
     })
 }
 
+fn pad_prepared_batch_rows_for_migraphx_tail(
+    prepared: PreparedDocumentBatch,
+    target_rows: usize,
+    config: &ColbertConfig,
+) -> Result<PreparedDocumentBatch> {
+    if target_rows < prepared.batch_size {
+        anyhow::bail!(
+            "MIGraphX tail row padding target has {} rows but batch contains {} documents",
+            target_rows,
+            prepared.batch_size
+        );
+    }
+    if prepared.tensor_batch_size < prepared.batch_size {
+        anyhow::bail!(
+            "prepared batch has {} tensor rows but {} real documents",
+            prepared.tensor_batch_size,
+            prepared.batch_size
+        );
+    }
+    if target_rows <= prepared.tensor_batch_size {
+        return Ok(prepared);
+    }
+
+    let source_rows = prepared.tensor_batch_size;
+    let source_len = prepared.batch_max_len;
+    let expected = source_rows.checked_mul(source_len).ok_or_else(|| {
+        anyhow::anyhow!("prepared batch source shape [{source_rows},{source_len}] overflows")
+    })?;
+    if prepared.all_input_ids.len() != expected {
+        anyhow::bail!(
+            "input_ids length {} does not match source shape [{},{}]",
+            prepared.all_input_ids.len(),
+            source_rows,
+            source_len
+        );
+    }
+    if prepared.all_attention_mask.len() != expected {
+        anyhow::bail!(
+            "attention_mask length {} does not match source shape [{},{}]",
+            prepared.all_attention_mask.len(),
+            source_rows,
+            source_len
+        );
+    }
+    if let Some(token_type_ids) = &prepared.all_token_type_ids {
+        if token_type_ids.len() != expected {
+            anyhow::bail!(
+                "token_type_ids length {} does not match source shape [{},{}]",
+                token_type_ids.len(),
+                source_rows,
+                source_len
+            );
+        }
+    }
+
+    let extra_elements = target_rows
+        .checked_sub(source_rows)
+        .and_then(|rows| rows.checked_mul(source_len))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "MIGraphX tail row padding target shape [{target_rows},{source_len}] overflows"
+            )
+        })?;
+    let default_input_id = if prepared.is_query && config.do_query_expansion {
+        config.mask_token_id as i64
+    } else {
+        config.pad_token_id as i64
+    };
+    let default_attention = if prepared.is_query && config.do_query_expansion {
+        1i64
+    } else {
+        0i64
+    };
+
+    let mut all_input_ids = prepared.all_input_ids;
+    all_input_ids.extend(std::iter::repeat_n(default_input_id, extra_elements));
+    let mut all_attention_mask = prepared.all_attention_mask;
+    all_attention_mask.extend(std::iter::repeat_n(default_attention, extra_elements));
+    let all_token_type_ids = prepared.all_token_type_ids.map(|mut ids| {
+        ids.extend(std::iter::repeat_n(0, extra_elements));
+        ids
+    });
+
+    onnx_diag!(
+        "MIGraphX warm-tail padded prepared batch shape=[{},{}] -> [{},{}]",
+        source_rows,
+        source_len,
+        target_rows,
+        source_len
+    );
+
+    Ok(PreparedDocumentBatch {
+        batch_size: prepared.batch_size,
+        tensor_batch_size: target_rows,
+        batch_max_len: prepared.batch_max_len,
+        all_input_ids,
+        all_attention_mask,
+        all_token_type_ids,
+        all_token_ids: prepared.all_token_ids,
+        original_lengths: prepared.original_lengths,
+        is_query: prepared.is_query,
+        filter_skiplist: prepared.filter_skiplist,
+        original_input_indices: prepared.original_input_indices,
+    })
+}
+
 impl MigraphxHybrid {
     fn new(
         model_dir: PathBuf,
@@ -2786,6 +2930,41 @@ impl MigraphxHybrid {
         }
         let cache_dir = self.shape_cache_dir(shape);
         self.marker_path(shape).exists() && shape_cache_has_mxr(&cache_dir)
+    }
+
+    fn warm_tail_shape_for_prepared(
+        &self,
+        prepared: &PreparedDocumentBatch,
+    ) -> Option<MigraphxStaticShape> {
+        if !migraphx_warm_tail_row_padding_enabled()
+            || prepared.is_query
+            || prepared.batch_size == 0
+            || prepared.tensor_batch_size > prepared.batch_size
+        {
+            return None;
+        }
+
+        self.supported_shapes
+            .iter()
+            .copied()
+            .filter(|shape| {
+                shape.sequence_length == prepared.batch_max_len
+                    && can_pad_migraphx_warm_tail_rows(prepared.batch_size, shape.batch_size)
+            })
+            .min_by_key(|shape| shape.batch_size)
+    }
+
+    fn warm_tail_shape_model_if_warm(
+        &self,
+        prepared: &PreparedDocumentBatch,
+    ) -> Result<Option<(MigraphxStaticShape, Colbert)>> {
+        let Some(shape) = self.warm_tail_shape_for_prepared(prepared) else {
+            return Ok(None);
+        };
+        if !self.is_shape_cache_warm(shape) {
+            return Ok(None);
+        }
+        Ok(self.shape_model_if_warm(shape)?.map(|model| (shape, model)))
     }
 
     fn invalidate_shape_cache(&self, shape: MigraphxStaticShape) {
@@ -2958,7 +3137,39 @@ impl MigraphxHybrid {
             }
         }
 
-        self.maybe_warm_shape(shape)?;
+        if let Some((tail_shape, model)) = self.warm_tail_shape_model_if_warm(&prepared)? {
+            let cpu_fallback = prepared.clone();
+            let padded = pad_prepared_batch_rows_for_migraphx_tail(
+                prepared,
+                tail_shape.batch_size,
+                &self.config,
+            )?;
+            match model.encode_prepared_documents(padded) {
+                Ok(embeddings) => {
+                    onnx_diag!(
+                        "MIGraphX hybrid used warm padded tail shape {:?} for {} real rows",
+                        tail_shape,
+                        cpu_fallback.batch_size
+                    );
+                    return Ok(embeddings);
+                }
+                Err(err) => {
+                    self.invalidate_shape_cache(tail_shape);
+                    onnx_diag!(
+                        "MIGraphX warm padded tail shape {:?} failed validation/run, falling back to CPU: {err:#}",
+                        tail_shape
+                    );
+                    return self.cpu_model()?.encode_prepared_documents(
+                        trim_prepared_batch_for_cpu_fallback(cpu_fallback)?,
+                    );
+                }
+            }
+        }
+
+        let warm_shape = self
+            .warm_tail_shape_for_prepared(&prepared)
+            .unwrap_or(shape);
+        self.maybe_warm_shape(warm_shape)?;
         onnx_diag!("MIGraphX hybrid CPU fallback for cold shape {:?}", shape);
         self.cpu_model()?
             .encode_prepared_documents(trim_prepared_batch_for_cpu_fallback(prepared)?)
@@ -3006,9 +3217,41 @@ impl MigraphxHybrid {
                     }
                 }
                 Ok(None) => {
-                    self.maybe_warm_shape(shape)?;
-                    onnx_diag!("MIGraphX hybrid CPU fallback for cold shape {:?}", shape);
-                    cpu_batches.push((batch_idx, prepared));
+                    if let Some((tail_shape, model)) =
+                        self.warm_tail_shape_model_if_warm(&prepared)?
+                    {
+                        let cpu_fallback = prepared.clone();
+                        let padded = pad_prepared_batch_rows_for_migraphx_tail(
+                            prepared,
+                            tail_shape.batch_size,
+                            &self.config,
+                        )?;
+                        match model.encode_prepared_documents(padded) {
+                            Ok(embeddings) => {
+                                onnx_diag!(
+                                    "MIGraphX hybrid used warm padded tail shape {:?} for {} real rows",
+                                    tail_shape,
+                                    cpu_fallback.batch_size
+                                );
+                                encoded_segments.push((batch_idx, embeddings));
+                            }
+                            Err(err) => {
+                                self.invalidate_shape_cache(tail_shape);
+                                onnx_diag!(
+                                    "MIGraphX warm padded tail shape {:?} failed validation/run, falling back to CPU: {err:#}",
+                                    tail_shape
+                                );
+                                cpu_batches.push((batch_idx, cpu_fallback));
+                            }
+                        }
+                    } else {
+                        let warm_shape = self
+                            .warm_tail_shape_for_prepared(&prepared)
+                            .unwrap_or(shape);
+                        self.maybe_warm_shape(warm_shape)?;
+                        onnx_diag!("MIGraphX hybrid CPU fallback for cold shape {:?}", shape);
+                        cpu_batches.push((batch_idx, prepared));
+                    }
                 }
                 Err(err) => {
                     self.invalidate_shape_cache(shape);
@@ -4051,6 +4294,54 @@ mod tests {
         assert_eq!(trimmed.all_input_ids, vec![0, 1, 2, 3, 4, 5]);
         assert_eq!(trimmed.all_attention_mask, vec![1; 6]);
         assert_eq!(trimmed.all_token_type_ids, None);
+    }
+
+    #[test]
+    fn test_pad_prepared_batch_rows_for_migraphx_tail_adds_dummy_rows() {
+        let config = ColbertConfig {
+            pad_token_id: 99,
+            ..Default::default()
+        };
+        let prepared = PreparedDocumentBatch {
+            batch_size: 2,
+            tensor_batch_size: 2,
+            batch_max_len: 3,
+            all_input_ids: vec![1, 2, 3, 4, 5, 6],
+            all_attention_mask: vec![1, 1, 1, 1, 1, 0],
+            all_token_type_ids: Some(vec![0, 0, 0, 0, 0, 0]),
+            all_token_ids: vec![vec![1, 2, 3], vec![4, 5]],
+            original_lengths: vec![3, 2],
+            is_query: false,
+            filter_skiplist: true,
+            original_input_indices: vec![0, 1],
+        };
+
+        let padded = pad_prepared_batch_rows_for_migraphx_tail(prepared, 4, &config).unwrap();
+
+        assert_eq!(padded.batch_size, 2);
+        assert_eq!(padded.tensor_batch_size, 4);
+        assert_eq!(padded.batch_max_len, 3);
+        assert_eq!(
+            padded.all_input_ids,
+            vec![1, 2, 3, 4, 5, 6, 99, 99, 99, 99, 99, 99]
+        );
+        assert_eq!(
+            padded.all_attention_mask,
+            vec![1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(padded.all_token_type_ids, Some(vec![0; 12]));
+        assert_eq!(padded.all_token_ids, vec![vec![1, 2, 3], vec![4, 5]]);
+        assert_eq!(padded.original_lengths, vec![3, 2]);
+        assert_eq!(padded.original_input_indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_can_pad_migraphx_warm_tail_rows_uses_bounded_factor() {
+        assert!(can_pad_migraphx_warm_tail_rows_with_factor(8, 16, 2));
+        assert!(can_pad_migraphx_warm_tail_rows_with_factor(3, 4, 2));
+        assert!(!can_pad_migraphx_warm_tail_rows_with_factor(7, 7, 2));
+        assert!(!can_pad_migraphx_warm_tail_rows_with_factor(7, 16, 2));
+        assert!(!can_pad_migraphx_warm_tail_rows_with_factor(0, 16, 2));
     }
 
     // =========================================================================
