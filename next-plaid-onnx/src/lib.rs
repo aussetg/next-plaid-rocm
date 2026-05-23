@@ -2480,6 +2480,30 @@ fn default_migraphx_background_warm_max_sequence_len() -> usize {
     migraphx_env_usize("NEXT_PLAID_MIGRAPHX_BACKGROUND_WARM_MAX_SEQUENCE_LEN").unwrap_or(512)
 }
 
+fn default_migraphx_background_warm_min_sequence_len() -> usize {
+    migraphx_env_usize("NEXT_PLAID_MIGRAPHX_BACKGROUND_WARM_MIN_SEQUENCE_LEN").unwrap_or(1)
+}
+
+#[cfg(all(feature = "migraphx", target_os = "linux"))]
+fn default_migraphx_background_nice() -> Option<i32> {
+    match std::env::var("NEXT_PLAID_MIGRAPHX_BACKGROUND_NICE") {
+        Ok(value) => {
+            let value = value.trim();
+            if value.is_empty() || value.eq_ignore_ascii_case("off") {
+                None
+            } else {
+                value.parse::<i32>().ok().map(|nice| nice.clamp(0, 19))
+            }
+        }
+        Err(_) => Some(10),
+    }
+}
+
+#[cfg(all(feature = "migraphx", target_os = "linux"))]
+fn migraphx_background_cpu_count() -> Option<usize> {
+    migraphx_env_usize("NEXT_PLAID_MIGRAPHX_BACKGROUND_CPU_COUNT").filter(|count| *count > 0)
+}
+
 fn default_migraphx_blocking_warm_max_sequence_len() -> usize {
     migraphx_env_usize("NEXT_PLAID_MIGRAPHX_WARM_MAX_SEQUENCE_LEN").unwrap_or(512)
 }
@@ -2603,6 +2627,134 @@ fn dummy_prepared_batch_for_migraphx_shape(
     }
 }
 
+#[cfg(all(feature = "migraphx", target_os = "linux"))]
+extern "C" {
+    fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+    fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const core::ffi::c_void) -> i32;
+}
+
+#[cfg(all(feature = "migraphx", target_os = "linux"))]
+fn set_bit(mask: &mut [u8], bit: usize) -> Result<()> {
+    if bit / 8 >= mask.len() {
+        anyhow::bail!("CPU index {bit} exceeds supported affinity mask size");
+    }
+    mask[bit / 8] |= 1u8 << (bit % 8);
+    Ok(())
+}
+
+#[cfg(all(feature = "migraphx", target_os = "linux"))]
+fn parse_cpu_affinity_mask(value: &str) -> Result<Vec<u8>> {
+    let mut mask = vec![0u8; 128];
+    let mut cpus = 0usize;
+
+    for part in value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let (start, end) = if let Some((start, end)) = part.split_once('-') {
+            let start = start
+                .trim()
+                .parse::<usize>()
+                .with_context(|| format!("invalid CPU affinity range start '{part}'"))?;
+            let end = end
+                .trim()
+                .parse::<usize>()
+                .with_context(|| format!("invalid CPU affinity range end '{part}'"))?;
+            if end < start {
+                anyhow::bail!("invalid CPU affinity range '{part}'");
+            }
+            (start, end)
+        } else {
+            let cpu = part
+                .parse::<usize>()
+                .with_context(|| format!("invalid CPU affinity entry '{part}'"))?;
+            (cpu, cpu)
+        };
+
+        for cpu in start..=end {
+            set_bit(&mut mask, cpu)?;
+            cpus += 1;
+        }
+    }
+
+    if cpus == 0 {
+        anyhow::bail!("CPU affinity list did not contain any CPUs");
+    }
+    Ok(mask)
+}
+
+#[cfg(all(feature = "migraphx", target_os = "linux"))]
+fn background_cpu_affinity_mask() -> Result<Option<Vec<u8>>> {
+    if let Ok(value) = std::env::var("NEXT_PLAID_MIGRAPHX_BACKGROUND_CPU_LIST") {
+        if !value.trim().is_empty() {
+            return parse_cpu_affinity_mask(&value).map(Some);
+        }
+    }
+
+    let Some(count) = migraphx_background_cpu_count() else {
+        return Ok(None);
+    };
+    let total = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(count)
+        .max(1);
+    let count = count.min(total).max(1);
+    let start = total - count;
+
+    let mut mask = vec![0u8; 128];
+    for cpu in start..total {
+        set_bit(&mut mask, cpu)?;
+    }
+    Ok(Some(mask))
+}
+
+#[cfg(feature = "migraphx")]
+fn apply_migraphx_warmer_child_process_controls() {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(nice) = default_migraphx_background_nice() {
+            // Raising the nice value is permitted for normal users and lowers
+            // compile-priority for this helper without changing the parent.
+            let rc = unsafe { setpriority(0, 0, nice) };
+            if rc != 0 {
+                onnx_diag!(
+                    "failed to set MIGraphX warmer nice value {}: {}",
+                    nice,
+                    std::io::Error::last_os_error()
+                );
+            } else {
+                onnx_diag!("MIGraphX warmer nice value set to {}", nice);
+            }
+        }
+
+        match background_cpu_affinity_mask() {
+            Ok(Some(mask)) => {
+                let rc = unsafe {
+                    sched_setaffinity(0, mask.len(), mask.as_ptr().cast::<core::ffi::c_void>())
+                };
+                if rc != 0 {
+                    onnx_diag!(
+                        "failed to set MIGraphX warmer CPU affinity: {}",
+                        std::io::Error::last_os_error()
+                    );
+                } else {
+                    onnx_diag!("MIGraphX warmer CPU affinity configured");
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                onnx_diag!("invalid MIGraphX warmer CPU affinity configuration: {err:#}");
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = default_migraphx_background_nice;
+    }
+}
+
 /// If this process was spawned as a MIGraphX background cache warmer, run the
 /// requested shape warmups and return `Ok(true)`. Binaries that want to support
 /// out-of-process background warming should call this before parsing their own
@@ -2619,6 +2771,8 @@ pub fn run_migraphx_warmer_child_if_requested() -> Result<bool> {
 
     #[cfg(feature = "migraphx")]
     {
+        apply_migraphx_warmer_child_process_controls();
+
         let model_dir = PathBuf::from(std::env::var(MIGRAPHX_WARMER_MODEL_DIR_ENV).with_context(
             || format!("{MIGRAPHX_WARMER_MODEL_DIR_ENV} is required for MIGraphX warmer child"),
         )?);
@@ -3075,6 +3229,13 @@ impl MigraphxHybrid {
             cpu_sessions
         );
 
+        if migraphx_warm_policy() == MigraphxWarmPolicy::Background {
+            *hybrid.background_warmer_started.lock().unwrap() = true;
+            if let Err(err) = hybrid.spawn_background_warmer_process() {
+                onnx_diag!("MIGraphX background warmer process spawn failed: {err:#}");
+            }
+        }
+
         Ok(hybrid)
     }
 
@@ -3240,12 +3401,16 @@ impl MigraphxHybrid {
     }
 
     fn background_warm_shapes(&self) -> Vec<MigraphxStaticShape> {
+        let min_sequence_len = default_migraphx_background_warm_min_sequence_len();
         let max_sequence_len = default_migraphx_background_warm_max_sequence_len();
         let mut shapes: Vec<_> = self
             .supported_shapes
             .iter()
             .copied()
-            .filter(|shape| shape.sequence_length <= max_sequence_len)
+            .filter(|shape| {
+                shape.sequence_length >= min_sequence_len
+                    && shape.sequence_length <= max_sequence_len
+            })
             .collect();
         shapes.sort_by_key(|shape| (shape.sequence_length, shape.batch_size));
         shapes
@@ -4588,6 +4753,18 @@ mod tests {
         );
         assert!(parse_migraphx_static_shape_list("16:128").is_err());
         assert!(parse_migraphx_static_shape_list("0x128").is_err());
+    }
+
+    #[cfg(all(feature = "migraphx", target_os = "linux"))]
+    #[test]
+    fn test_parse_cpu_affinity_mask() {
+        let mask = parse_cpu_affinity_mask("0,2-3").unwrap();
+        assert_eq!(mask[0] & 0b0000_0001, 0b0000_0001);
+        assert_eq!(mask[0] & 0b0000_0100, 0b0000_0100);
+        assert_eq!(mask[0] & 0b0000_1000, 0b0000_1000);
+        assert_eq!(mask[0] & 0b0000_0010, 0);
+        assert!(parse_cpu_affinity_mask("3-2").is_err());
+        assert!(parse_cpu_affinity_mask("").is_err());
     }
 
     // =========================================================================

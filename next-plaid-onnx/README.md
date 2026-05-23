@@ -124,7 +124,12 @@ to warm missing fixed-shape caches while the current process keeps using CPU
 fallback for cold shapes. The cache marker is written only after the helper has
 validated the shape, so current-process inference will not consume partial MXR
 cache files. Background graph compilation is CPU-heavy, so it primarily prepares
-future runs and may compete with the active process for CPU resources.
+future runs and may compete with the active process for CPU resources. On Linux,
+the helper defaults to nice value `10`; use
+`NEXT_PLAID_MIGRAPHX_BACKGROUND_CPU_COUNT`,
+`NEXT_PLAID_MIGRAPHX_BACKGROUND_CPU_LIST`, and the background min/max sequence
+length env vars to further limit what it compiles while another workload is
+running.
 
 For workloads dominated by long documents, ROCm users can opt into a shorter
 document-token cap:

@@ -698,7 +698,16 @@ NEXT_PLAID_MIGRAPHX_WARM_CACHE=background colgrep --force-gpu init .
 Background warming is out-of-process so a MIGraphX compiler crash cannot take
 down the indexing process. It still uses CPU cores for graph compilation, so it
 is mainly useful to prepare later indexing/search runs rather than to guarantee
-a faster first run.
+a faster first run. By default the helper runs with a lower CPU scheduling
+priority. For example, to warm only long-document shapes on two logical CPUs:
+
+```bash
+NEXT_PLAID_MIGRAPHX_WARM_CACHE=background \
+NEXT_PLAID_MIGRAPHX_BACKGROUND_WARM_MIN_SEQUENCE_LEN=1024 \
+NEXT_PLAID_MIGRAPHX_BACKGROUND_WARM_MAX_SEQUENCE_LEN=2048 \
+NEXT_PLAID_MIGRAPHX_BACKGROUND_CPU_COUNT=2 \
+colgrep --force-gpu init .
+```
 
 For large repositories, you can opt into a ROCm-specific document-token cap to
 reduce indexing time and GPU memory use:
@@ -727,6 +736,10 @@ part of your workflow.
 | `NEXT_PLAID_MIGRAPHX_STATIC_CACHE_ROOT` | Override fixed-shape MIGraphX cache directory                |
 | `NEXT_PLAID_MIGRAPHX_WARM_MAX_SEQUENCE_LEN` | Max sequence length warmed by `warm-rocm-cache`          |
 | `NEXT_PLAID_MIGRAPHX_WARM_CACHE`        | `background` starts a separate cache-warming process during ROCm runs; `blocking` warms synchronously |
+| `NEXT_PLAID_MIGRAPHX_BACKGROUND_NICE`   | Nice value for background ROCm cache warmer on Linux; default `10`, set `off` to disable |
+| `NEXT_PLAID_MIGRAPHX_BACKGROUND_CPU_COUNT` | Pin background ROCm cache warmer to the last N logical CPUs on Linux |
+| `NEXT_PLAID_MIGRAPHX_BACKGROUND_CPU_LIST` | Explicit Linux CPU affinity list for background warmer, e.g. `0,2-3` |
+| `NEXT_PLAID_MIGRAPHX_BACKGROUND_WARM_MIN_SEQUENCE_LEN` | Minimum sequence length warmed by background ROCm cache warming |
 | `NEXT_PLAID_MIGRAPHX_BACKGROUND_WARM_MAX_SEQUENCE_LEN` | Max sequence length warmed by background ROCm cache warming |
 
 ---
