@@ -151,6 +151,39 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "migraphx")]
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
+fn migraphx_env_flag_enabled(name: &str) -> bool {
+    #[cfg(feature = "migraphx")]
+    {
+        env_flag_enabled(name)
+    }
+
+    #[cfg(not(feature = "migraphx"))]
+    {
+        let _ = name;
+        false
+    }
+}
+
+fn migraphx_env_usize(name: &str) -> Option<usize> {
+    #[cfg(feature = "migraphx")]
+    {
+        env_usize(name)
+    }
+
+    #[cfg(not(feature = "migraphx"))]
+    {
+        let _ = name;
+        None
+    }
+}
+
 fn prepared_batch_summary(batches: &[PreparedDocumentBatch]) -> String {
     let docs: usize = batches.iter().map(|batch| batch.batch_size).sum();
     let tensor_rows: usize = batches.iter().map(|batch| batch.tensor_batch_size).sum();
@@ -1580,11 +1613,18 @@ impl Colbert {
                 }
                 // For MIGraphX we must avoid per-batch sequence lengths like
                 // 255/505/1008, because each distinct tensor shape triggers a
-                // new compile/cache entry. Keep the real row count, though:
+                // new compile/cache entry. By default, keep the real row count:
                 // padding a small/final short-doc batch up to `shape.docs`
-                // can turn one real document into a 1024-row tensor.
+                // can turn one real document into a 1024-row tensor. An
+                // env-gated MIGraphX diagnostic mode can pad rows too, but only
+                // within a bounded factor of the real row count.
+                let planned_rows = planned_tensor_rows_for_provider(
+                    self.requested_execution_provider,
+                    piece_encodings.len(),
+                    shape.docs,
+                );
                 let planned_shape = pad_to_planned_sequence_len.then_some(FixedDynamicShape {
-                    docs: piece_encodings.len(),
+                    docs: planned_rows,
                     planned_len: shape.planned_len,
                 });
                 batches.push(prepare_batch_from_tokenized_documents(
@@ -2107,6 +2147,47 @@ fn execution_provider_prefers_planned_sequence_lengths(provider: ExecutionProvid
             preferred_gpu_execution_provider() == Some(ExecutionProvider::MIGraphX)
         }
         _ => false,
+    }
+}
+
+fn execution_provider_can_pad_planned_batch_rows(provider: ExecutionProvider) -> bool {
+    if !migraphx_env_flag_enabled("NEXT_PLAID_MIGRAPHX_PAD_BATCH_ROWS") {
+        return false;
+    }
+
+    match provider {
+        ExecutionProvider::MIGraphX => true,
+        ExecutionProvider::Auto => {
+            preferred_gpu_execution_provider() == Some(ExecutionProvider::MIGraphX)
+        }
+        _ => false,
+    }
+}
+
+fn planned_tensor_rows_for_provider(
+    provider: ExecutionProvider,
+    real_rows: usize,
+    planned_rows: usize,
+) -> usize {
+    if real_rows == 0 || planned_rows <= real_rows {
+        return real_rows;
+    }
+
+    if !execution_provider_can_pad_planned_batch_rows(provider) {
+        return real_rows;
+    }
+
+    // Row padding is intentionally bounded. Full planned-shape padding can turn
+    // tiny inputs into huge tensors (e.g. one short document in a 1024-row
+    // bucket). For experiments, pad only when the planned row count is within a
+    // configurable multiplicative factor of the real row count.
+    let max_factor = migraphx_env_usize("NEXT_PLAID_MIGRAPHX_MAX_ROW_PADDING_FACTOR")
+        .unwrap_or(2)
+        .max(1);
+    if planned_rows <= real_rows.saturating_mul(max_factor) {
+        planned_rows
+    } else {
+        real_rows
     }
 }
 
