@@ -1,0 +1,14 @@
+# Stable query set for benchmarking colgrep on this repository.
+#
+# Lines are JSON objects consumed by benchmark_colgrep_reference.py. Keep this
+# file repo-focused: the Makefile target defaults PROJECT to the repository root.
+{"name":"error-handling","query":"error handling and graceful failure paths","args":[]}
+{"name":"model-loading","query":"load the embedding model and initialize onnx runtime","args":[]}
+{"name":"index-update","query":"incremental index update when files change","args":[]}
+{"name":"regex-hybrid-rust","query":"command line argument parsing","args":["-e","clap|Parser","--include","*.rs"]}
+{"name":"json-output","query":"serialize search results as json","args":["--include","*.rs"]}
+{"name":"acceleration-flags","query":"force CPU force GPU acceleration mode command line flags","args":["-e","force_cpu|force_gpu|AccelerationMode","--include","*.rs"]}
+{"name":"onnx-runtime-setup","query":"ONNX Runtime dynamic library download cache and execution provider setup","args":["-e","ORT_DYLIB_PATH|onnxruntime|ExecutionProvider","--include","*.rs"]}
+{"name":"rocm-migraphx","query":"MIGraphX execution provider configuration for AMD ROCm GPUs","args":["-e","MIGraphX|migraphx|ROCm|rocm","--include","*.rs"]}
+{"name":"residual-codec","query":"PLAID residual codec compresses embeddings into centroid codes and quantized residuals","args":["--semantic-only","--include","*.rs"],"paths":["next-plaid/src"]}
+{"name":"benchmark-harness","query":"benchmark harness compares reference and candidate colgrep JSON results","args":["--include","*.py"],"paths":["docs/benchmarks"]}

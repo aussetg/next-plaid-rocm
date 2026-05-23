@@ -176,10 +176,10 @@ benchmark-fastplaid-compat:
 	cd docs/benchmarks && uv sync --python 3.12 --extra eval && uv run python benchmark_fastplaid_compat.py
 
 # Benchmark this workspace's colgrep against the locally installed reference (/usr/bin/colgrep)
-# Usage: make benchmark-colgrep-reference PROJECT=/path/to/project MODEL=lightonai/LateOn-Code-edge
+# Usage: make benchmark-colgrep-reference PROJECT=/path/to/project MODEL=lightonai/LateOn-Code-edge QUERIES=queries.jsonl
 benchmark-colgrep-reference:
 	cargo build --release -p colgrep
-	cd docs/benchmarks && uv sync --extra dev && uv run python benchmark_colgrep_reference.py --project $(or $(PROJECT),../..) --model $(or $(MODEL),lightonai/LateOn-Code-edge)
+	cd docs/benchmarks && uv sync --extra dev && uv run python benchmark_colgrep_reference.py --project $(or $(PROJECT),../..) --model $(or $(MODEL),lightonai/LateOn-Code-edge) --queries $(or $(QUERIES),colgrep_reference_queries.jsonl)
 
 # =============================================================================
 # Docker targets
