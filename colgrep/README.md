@@ -673,17 +673,46 @@ Lookup order:
 On Linux, ColGREP may re-exec itself once to add the ONNX Runtime, cuDNN, or
 ROCm library directories to `LD_LIBRARY_PATH` before ONNX Runtime is loaded.
 
+### ROCm / MIGraphX Performance
+
+ROCm support uses ONNX Runtime's MIGraphX Execution Provider for embedding
+inference. MIGraphX is fastest when its fixed-shape model caches have already
+been compiled:
+
+```bash
+# Precompile common fixed-shape MIGraphX caches for the active/default model
+colgrep warm-rocm-cache
+
+# Or for a specific model
+colgrep warm-rocm-cache --model lightonai/LateOn-Code-edge
+```
+
+For large repositories, you can opt into a ROCm-specific document-token cap to
+reduce indexing time and GPU memory use:
+
+```bash
+NEXT_PLAID_MIGRAPHX_DOCUMENT_LENGTH=512 colgrep --force-gpu init .
+```
+
+This keeps ROCm indexing on shorter fixed shapes and can be much faster, but it
+changes the maximum document length used for embeddings. It is therefore **not
+enabled by default**; validate search quality on your codebase before making it
+part of your workflow.
+
 ---
 
 ## Environment Variables
 
-| Variable                 | Description                          |
-| ------------------------ | ------------------------------------ |
-| `ORT_DYLIB_PATH`         | Path to ONNX Runtime library         |
-| `XDG_DATA_HOME`          | Override data directory              |
-| `XDG_CONFIG_HOME`        | Override config directory            |
-| `HF_TOKEN`               | HuggingFace token for private models |
-| `HUGGING_FACE_HUB_TOKEN` | Alternative HF token variable        |
+| Variable                                | Description                                                  |
+| --------------------------------------- | ------------------------------------------------------------ |
+| `ORT_DYLIB_PATH`                        | Path to ONNX Runtime library                                 |
+| `XDG_DATA_HOME`                         | Override data directory                                      |
+| `XDG_CONFIG_HOME`                       | Override config directory                                    |
+| `HF_TOKEN`                              | HuggingFace token for private models                         |
+| `HUGGING_FACE_HUB_TOKEN`                | Alternative HF token variable                                |
+| `NEXT_PLAID_MIGRAPHX_DOCUMENT_LENGTH`   | Optional ROCm/MIGraphX max document-token cap, e.g. `512`    |
+| `NEXT_PLAID_MIGRAPHX_STATIC_CACHE_ROOT` | Override fixed-shape MIGraphX cache directory                |
+| `NEXT_PLAID_MIGRAPHX_WARM_MAX_SEQUENCE_LEN` | Max sequence length warmed by `warm-rocm-cache`          |
 
 ---
 

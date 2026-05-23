@@ -112,6 +112,25 @@ The CLS token is always preserved. Clusters are replaced by their centroid embed
 | Parallel CPU | `.with_quantized(true).with_parallel(25).with_batch_size(2)` | High throughput |
 | GPU | `.with_execution_provider(ExecutionProvider::Cuda).with_batch_size(64)` | Large batches |
 
+#### ROCm / MIGraphX
+
+MIGraphX compiles optimized GPU programs per input shape. For best CLI-style
+latency, use fixed-shape caches and avoid compiling new shapes in the hot path.
+The ColBERT builder exposes this through the MIGraphX static-shape cache APIs,
+and ColGREP provides `colgrep warm-rocm-cache` as a user-facing wrapper.
+
+For workloads dominated by long documents, ROCm users can opt into a shorter
+document-token cap:
+
+```bash
+NEXT_PLAID_MIGRAPHX_DOCUMENT_LENGTH=512 your-command
+```
+
+This can significantly reduce indexing time and memory use by keeping MIGraphX
+on shorter fixed shapes, but it changes truncation for document embeddings. It
+is intentionally opt-in; validate retrieval quality before enabling it by
+default in your environment.
+
 ### API Reference
 
 #### `Colbert`
