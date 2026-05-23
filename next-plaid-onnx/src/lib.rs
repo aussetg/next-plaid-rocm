@@ -111,6 +111,8 @@ use ort::execution_providers::DirectMLExecutionProvider;
 use ort::execution_providers::MIGraphXExecutionProvider;
 #[cfg(feature = "tensorrt")]
 use ort::execution_providers::TensorRTExecutionProvider;
+#[cfg(feature = "migraphx")]
+use ort::ortsys;
 
 use ort::session::builder::SessionBuilder;
 
@@ -697,11 +699,37 @@ fn configure_migraphx(builder: SessionBuilder) -> Result<SessionBuilder> {
     if is_force_cpu() {
         return Ok(builder);
     }
-    builder
-        .with_execution_providers([MIGraphXExecutionProvider::default()
-            .build()
-            .error_on_failure()])
-        .context("Failed to configure MIGraphX execution provider. Ensure ROCm and MIGraphX are installed.")
+    let mut builder = builder;
+    append_migraphx_execution_provider(&mut builder).context(
+        "Failed to configure MIGraphX execution provider. Ensure ROCm and MIGraphX are installed.",
+    )?;
+    Ok(builder)
+}
+
+#[cfg(feature = "migraphx")]
+fn append_migraphx_execution_provider(builder: &mut SessionBuilder) -> ort::Result<()> {
+    use ort::AsPointer;
+
+    // Use the provider-options map API instead of the legacy
+    // `OrtMIGraphXProviderOptions` struct. The Rust `ort` crate currently ships
+    // an older struct layout, and ORT 1.24's legacy MIGraphX wrapper also
+    // stringifies an empty model-cache path as `""`, which enables MXR caching
+    // to an invalid directory. Supplying only explicit non-default options via
+    // the map leaves MIGraphX's cache path truly empty.
+    let provider_name = std::ffi::CString::new("MIGraphXExecutionProvider").unwrap();
+    let keys = [std::ffi::CString::new("device_id").unwrap()];
+    let values = [std::ffi::CString::new("0").unwrap()];
+    let key_ptrs = keys.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
+    let value_ptrs = values.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
+
+    ortsys![unsafe SessionOptionsAppendExecutionProvider(
+        builder.ptr_mut(),
+        provider_name.as_ptr(),
+        key_ptrs.as_ptr(),
+        value_ptrs.as_ptr(),
+        key_ptrs.len(),
+    )?];
+    Ok(())
 }
 
 #[cfg(not(feature = "migraphx"))]
