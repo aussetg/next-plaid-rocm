@@ -721,6 +721,12 @@ changes the maximum document length used for embeddings. It is therefore **not
 enabled by default**; validate search quality on your codebase before making it
 part of your workflow.
 
+For one-shot `colgrep search`, ROCm/MIGraphX query embedding defaults to CPU
+even when `--force-gpu` is set. A warmed MIGraphX query shape can execute very
+quickly once loaded, but process/session setup dominates normal CLI searches.
+Set `NEXT_PLAID_MIGRAPHX_QUERY_GPU=1` only for diagnostics or long-lived
+wrappers that can amortize that setup cost.
+
 ---
 
 ## Environment Variables
@@ -733,6 +739,7 @@ part of your workflow.
 | `HF_TOKEN`                              | HuggingFace token for private models                         |
 | `HUGGING_FACE_HUB_TOKEN`                | Alternative HF token variable                                |
 | `NEXT_PLAID_MIGRAPHX_DOCUMENT_LENGTH`   | Optional ROCm/MIGraphX max document-token cap, e.g. `512`    |
+| `NEXT_PLAID_MIGRAPHX_QUERY_GPU`         | Opt into MIGraphX query embedding for search; defaults to CPU for one-shot CLI latency |
 | `NEXT_PLAID_MIGRAPHX_STATIC_CACHE_ROOT` | Override fixed-shape MIGraphX cache directory                |
 | `NEXT_PLAID_MIGRAPHX_WARM_MAX_SEQUENCE_LEN` | Max sequence length warmed by `warm-rocm-cache`          |
 | `NEXT_PLAID_MIGRAPHX_WARM_CACHE`        | `background` starts a separate cache-warming process during ROCm runs; `blocking` warms synchronously |

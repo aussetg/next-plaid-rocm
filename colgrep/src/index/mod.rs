@@ -2920,6 +2920,35 @@ pub struct Searcher {
     index_path: String,
 }
 
+const MIGRAPHX_QUERY_GPU_ENV: &str = "NEXT_PLAID_MIGRAPHX_QUERY_GPU";
+
+fn migraphx_query_gpu_enabled_from_value(value: Option<&str>) -> bool {
+    value
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn migraphx_query_gpu_enabled() -> bool {
+    migraphx_query_gpu_enabled_from_value(std::env::var(MIGRAPHX_QUERY_GPU_ENV).ok().as_deref())
+}
+
+fn search_force_gpu_migraphx_short_circuits_to_cpu(acceleration_mode: AccelerationMode) -> bool {
+    acceleration_mode == AccelerationMode::ForceGpu
+        && !migraphx_query_gpu_enabled()
+        && next_plaid_onnx::compiled_gpu_execution_provider() == Some(ExecutionProvider::MIGraphX)
+}
+
+fn emit_migraphx_query_cpu_notice() {
+    eprintln!(
+        "ℹ️  ROCm/MIGraphX query encoding defaults to CPU for one-shot search; set {MIGRAPHX_QUERY_GPU_ENV}=1 to opt into GPU query encoding."
+    );
+}
+
 fn apply_search_acceleration_mode(acceleration_mode: AccelerationMode) {
     match acceleration_mode {
         AccelerationMode::ForceGpu => apply_acceleration_mode(AccelerationMode::ForceGpu),
@@ -2938,7 +2967,15 @@ fn resolve_search_execution_provider(
     acceleration_mode: AccelerationMode,
 ) -> Result<ExecutionProvider> {
     match acceleration_mode {
-        AccelerationMode::ForceGpu => require_colgrep_gpu_provider(),
+        AccelerationMode::ForceGpu => {
+            let provider = require_colgrep_gpu_provider()?;
+            if provider == ExecutionProvider::MIGraphX && !migraphx_query_gpu_enabled() {
+                emit_migraphx_query_cpu_notice();
+                Ok(ExecutionProvider::Cpu)
+            } else {
+                Ok(provider)
+            }
+        }
         AccelerationMode::ForceCpu => Ok(ExecutionProvider::Cpu),
         AccelerationMode::Auto => {
             if next_plaid_onnx::is_coreml_available() {
@@ -2948,6 +2985,25 @@ fn resolve_search_execution_provider(
             }
         }
     }
+}
+
+fn prepare_search_execution_provider(
+    acceleration_mode: AccelerationMode,
+) -> Result<ExecutionProvider> {
+    if search_force_gpu_migraphx_short_circuits_to_cpu(acceleration_mode) {
+        emit_migraphx_query_cpu_notice();
+        apply_acceleration_mode(AccelerationMode::ForceCpu);
+        crate::onnx_runtime::ensure_onnx_runtime().context("Failed to initialize ONNX Runtime")?;
+        return Ok(ExecutionProvider::Cpu);
+    }
+
+    apply_search_acceleration_mode(acceleration_mode);
+    crate::onnx_runtime::ensure_onnx_runtime().context("Failed to initialize ONNX Runtime")?;
+    let execution_provider = resolve_search_execution_provider(acceleration_mode)?;
+    if execution_provider == ExecutionProvider::Cpu {
+        apply_acceleration_mode(AccelerationMode::ForceCpu);
+    }
+    Ok(execution_provider)
 }
 
 /// Return whether next-plaid's PLAID index-building stage should run on CPU
@@ -2986,10 +3042,7 @@ impl Searcher {
         let index_path = vector_dir.to_str().unwrap().to_string();
 
         let acceleration_mode = env_acceleration_mode_lossy();
-        apply_search_acceleration_mode(acceleration_mode);
-
-        crate::onnx_runtime::ensure_onnx_runtime().context("Failed to initialize ONNX Runtime")?;
-        let execution_provider = resolve_search_execution_provider(acceleration_mode)?;
+        let execution_provider = prepare_search_execution_provider(acceleration_mode)?;
 
         // Cap intra-op threads to avoid overhead on high-core-count systems
         let num_threads = std::thread::available_parallelism()
@@ -3033,10 +3086,7 @@ impl Searcher {
         let index_path = vector_dir.to_str().unwrap().to_string();
 
         let acceleration_mode = env_acceleration_mode_lossy();
-        apply_search_acceleration_mode(acceleration_mode);
-
-        crate::onnx_runtime::ensure_onnx_runtime().context("Failed to initialize ONNX Runtime")?;
-        let execution_provider = resolve_search_execution_provider(acceleration_mode)?;
+        let execution_provider = prepare_search_execution_provider(acceleration_mode)?;
 
         // Cap intra-op threads to avoid overhead on high-core-count systems
         let num_threads = std::thread::available_parallelism()
@@ -3866,6 +3916,18 @@ mod tests {
         assert!(!embedding_provider_requires_plaid_cpu(
             ExecutionProvider::Cpu
         ));
+    }
+
+    #[test]
+    fn test_migraphx_query_gpu_env_parser() {
+        assert!(!migraphx_query_gpu_enabled_from_value(None));
+        assert!(!migraphx_query_gpu_enabled_from_value(Some("")));
+        assert!(!migraphx_query_gpu_enabled_from_value(Some("0")));
+        assert!(!migraphx_query_gpu_enabled_from_value(Some("false")));
+        assert!(migraphx_query_gpu_enabled_from_value(Some("1")));
+        assert!(migraphx_query_gpu_enabled_from_value(Some("true")));
+        assert!(migraphx_query_gpu_enabled_from_value(Some("YES")));
+        assert!(migraphx_query_gpu_enabled_from_value(Some(" on ")));
     }
 
     #[test]
