@@ -932,7 +932,15 @@ impl IndexBuilder {
     fn is_using_gpu(&self) -> bool {
         self.model
             .as_ref()
-            .is_some_and(|m| !matches!(m.requested_execution_provider, ExecutionProvider::Cpu))
+            .is_some_and(|m| m.requested_execution_provider.is_gpu())
+    }
+
+    /// Whether PLAID index coding should be forced to CPU for the current
+    /// embedding provider.
+    fn plaid_force_cpu(&self) -> bool {
+        self.model
+            .as_ref()
+            .is_some_and(|m| plaid_force_cpu_for_embedding_provider(m.requested_execution_provider))
     }
 
     /// Drop the current GPU model and rebuild with CPU execution.
@@ -976,7 +984,7 @@ impl IndexBuilder {
         index_path: &str,
         pb: Option<&ProgressBar>,
     ) -> Result<bool> {
-        let force_cpu = next_plaid::is_force_cpu();
+        let force_cpu = self.plaid_force_cpu();
         let config = IndexConfig {
             force_cpu,
             ..Default::default()
@@ -1023,7 +1031,7 @@ impl IndexBuilder {
 
                     self.rebuild_model_for_cpu()?;
 
-                    let force_cpu = next_plaid::is_force_cpu();
+                    let force_cpu = self.plaid_force_cpu();
                     let config = IndexConfig {
                         force_cpu,
                         ..Default::default()
@@ -2892,6 +2900,26 @@ fn resolve_search_execution_provider(
     }
 }
 
+/// Return whether next-plaid's PLAID index-building stage should run on CPU
+/// for a given ONNX embedding provider.
+///
+/// ROCm/MIGraphX and DirectML currently accelerate ONNX model inference only;
+/// next-plaid has no matching HIP/DirectML backend for k-means or residual
+/// coding. In mixed builds such as `--features cuda,rocm`, keeping
+/// `NEXT_PLAID_FORCE_GPU=1` while selecting MIGraphX for embeddings would make
+/// next-plaid try its CUDA backend and fail. Force the PLAID stage to CPU for
+/// inference providers that do not imply a compatible next-plaid GPU backend.
+fn plaid_force_cpu_for_embedding_provider(provider: ExecutionProvider) -> bool {
+    next_plaid::is_force_cpu() || embedding_provider_requires_plaid_cpu(provider)
+}
+
+fn embedding_provider_requires_plaid_cpu(provider: ExecutionProvider) -> bool {
+    matches!(
+        provider,
+        ExecutionProvider::DirectML | ExecutionProvider::MIGraphX
+    )
+}
+
 impl Searcher {
     pub fn load(project_root: &Path, model_id: &str, model_path: &Path) -> Result<Self> {
         Self::load_with_quantized(project_root, model_id, model_path, false)
@@ -3717,6 +3745,29 @@ fn prompt_large_index_confirmation(num_units: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_embedding_provider_requires_plaid_cpu_for_inference_only_backends() {
+        assert!(embedding_provider_requires_plaid_cpu(
+            ExecutionProvider::MIGraphX
+        ));
+        assert!(embedding_provider_requires_plaid_cpu(
+            ExecutionProvider::DirectML
+        ));
+
+        assert!(!embedding_provider_requires_plaid_cpu(
+            ExecutionProvider::Cuda
+        ));
+        assert!(!embedding_provider_requires_plaid_cpu(
+            ExecutionProvider::TensorRT
+        ));
+        assert!(!embedding_provider_requires_plaid_cpu(
+            ExecutionProvider::CoreML
+        ));
+        assert!(!embedding_provider_requires_plaid_cpu(
+            ExecutionProvider::Cpu
+        ));
+    }
 
     #[test]
     fn test_glob_simple_extension() {
