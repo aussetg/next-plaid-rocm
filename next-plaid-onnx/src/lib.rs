@@ -2862,9 +2862,66 @@ pub fn run_migraphx_warmer_child_if_requested() -> Result<bool> {
     }
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct MigraphxCacheOptions {
+    entries: Vec<(String, String)>,
+}
+
+impl MigraphxCacheOptions {
+    fn from_env() -> Self {
+        let mut entries = Vec::new();
+
+        if migraphx_env_flag_enabled("NEXT_PLAID_MIGRAPHX_FP16") {
+            entries.push(("migraphx_fp16_enable".to_string(), "1".to_string()));
+        }
+
+        // ORT documents these environment variables as global MIGraphX knobs
+        // that take precedence over provider/session options. Include any
+        // non-empty values in the static MXR cache key so user overrides do
+        // not accidentally reuse validation markers from a differently
+        // compiled graph. Cache-path variables themselves are intentionally
+        // excluded because this function chooses our per-shape cache path.
+        for name in [
+            "ORT_MIGRAPHX_FP16_ENABLE",
+            "ORT_MIGRAPHX_BF16_ENABLE",
+            "ORT_MIGRAPHX_INT8_ENABLE",
+            "ORT_MIGRAPHX_FP8_ENABLE",
+            "ORT_MIGRAPHX_INT8_CALIBRATION_TABLE_NAME",
+            "ORT_MIGRAPHX_INT8_USE_NATIVE_CALIBRATION_TABLE",
+            "ORT_MIGRAPHX_EXHAUSTIVE_TUNE",
+            "ORT_MIGRAPHX_MEM_LIMIT",
+        ] {
+            if let Ok(value) = std::env::var(name) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    entries.push((name.to_string(), value.to_string()));
+                }
+            }
+        }
+
+        entries.sort();
+        Self { entries }
+    }
+}
+
 fn cache_key_for_onnx(path: &Path, quantized: bool) -> String {
+    cache_key_for_onnx_with_options(path, quantized, MigraphxCacheOptions::from_env())
+}
+
+fn cache_key_for_onnx_with_options(
+    path: &Path,
+    quantized: bool,
+    migraphx_options: MigraphxCacheOptions,
+) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Include MIGraphX provider options in the cache key. Options such as
+    // `migraphx_fp16_enable` change the compiled MXR program, and sharing a
+    // validated marker/cache directory across option sets can make a later run
+    // load an incompatible graph. Bump the namespace so older option-agnostic
+    // cache directories are not treated as validated for new runs.
+    "migraphx-static-cache-v2".hash(&mut hasher);
     quantized.hash(&mut hasher);
+    migraphx_options.hash(&mut hasher);
     path.canonicalize()
         .unwrap_or_else(|_| path.to_path_buf())
         .display()
@@ -4728,6 +4785,55 @@ mod tests {
         assert!(!can_pad_migraphx_warm_tail_rows_with_factor(7, 7, 2));
         assert!(!can_pad_migraphx_warm_tail_rows_with_factor(7, 16, 2));
         assert!(!can_pad_migraphx_warm_tail_rows_with_factor(0, 16, 2));
+    }
+
+    #[test]
+    fn test_migraphx_cache_key_includes_precision_options() {
+        let path = std::path::Path::new("/tmp/next-plaid-cache-key-test/model.onnx");
+
+        let fp32_key = cache_key_for_onnx_with_options(
+            path,
+            false,
+            MigraphxCacheOptions {
+                entries: Vec::new(),
+            },
+        );
+        let fp16_key = cache_key_for_onnx_with_options(
+            path,
+            false,
+            MigraphxCacheOptions {
+                entries: vec![("migraphx_fp16_enable".to_string(), "1".to_string())],
+            },
+        );
+        let ort_fp16_key = cache_key_for_onnx_with_options(
+            path,
+            false,
+            MigraphxCacheOptions {
+                entries: vec![("ORT_MIGRAPHX_FP16_ENABLE".to_string(), "1".to_string())],
+            },
+        );
+        let int8_key = cache_key_for_onnx_with_options(
+            path,
+            true,
+            MigraphxCacheOptions {
+                entries: Vec::new(),
+            },
+        );
+
+        assert_ne!(fp32_key, fp16_key);
+        assert_ne!(fp32_key, ort_fp16_key);
+        assert_ne!(fp32_key, int8_key);
+        assert_ne!(fp16_key, int8_key);
+        assert_eq!(
+            fp32_key,
+            cache_key_for_onnx_with_options(
+                path,
+                false,
+                MigraphxCacheOptions {
+                    entries: Vec::new(),
+                }
+            )
+        );
     }
 
     #[cfg(feature = "migraphx")]
