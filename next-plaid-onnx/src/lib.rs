@@ -346,8 +346,13 @@ fn unavailable_gpu_execution_provider_reason() -> String {
         "no GPU execution provider was compiled. Enable a feature such as 'cuda', 'rocm'/'migraphx', 'coreml', or 'directml'.".to_string()
     } else {
         let names = execution_provider_list_display(&compiled);
+        let rocm_hint = if compiled.contains(&ExecutionProvider::MIGraphX) {
+            " For ROCm/MIGraphX, install AMD's `onnxruntime-migraphx` wheel or use a custom ORT build, then set ORT_DYLIB_PATH to its `onnxruntime/capi/libonnxruntime.so`."
+        } else {
+            ""
+        };
         format!(
-            "no compiled GPU execution provider is available in the loaded ONNX Runtime library. Compiled provider(s): {names}."
+            "no compiled GPU execution provider is available in the loaded ONNX Runtime library. Compiled provider(s): {names}.{rocm_hint}"
         )
     }
 }

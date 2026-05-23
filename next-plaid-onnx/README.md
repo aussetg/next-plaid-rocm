@@ -84,6 +84,12 @@ next-plaid-onnx = { version = "0.2", features = ["rocm"] }
 
 The `rocm` feature is a user-facing alias for `migraphx`. ONNX Runtime 1.23 no longer ships the older ROCm Execution Provider, so AMD GPU inference uses the MIGraphX Execution Provider and requires an ONNX Runtime build that includes MIGraphX.
 
+For ROCm, install AMD's ONNX Runtime wheel for your ROCm release (for example
+`pip install onnxruntime-migraphx -f https://repo.radeon.com/rocm/manylinux/rocm-rel-<ROCM_VERSION>/`)
+or provide a custom ONNX Runtime build, then set `ORT_DYLIB_PATH` to
+`.../site-packages/onnxruntime/capi/libonnxruntime.so` before starting the
+process. The official GitHub CPU ONNX Runtime package does not include MIGraphX.
+
 ### Token Pooling
 
 Reduce token count with hierarchical clustering (Ward's method):
