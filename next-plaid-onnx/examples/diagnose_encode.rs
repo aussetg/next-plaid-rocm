@@ -140,6 +140,10 @@ fn elapsed_ms(start: Instant) -> f64 {
 }
 
 fn main() -> Result<()> {
+    if next_plaid_onnx::run_migraphx_warmer_child_if_requested()? {
+        return Ok(());
+    }
+
     let args = parse_args()?;
     let texts = load_texts(&args)?;
     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();

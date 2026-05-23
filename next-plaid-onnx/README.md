@@ -119,6 +119,13 @@ latency, use fixed-shape caches and avoid compiling new shapes in the hot path.
 The ColBERT builder exposes this through the MIGraphX static-shape cache APIs,
 and ColGREP provides `colgrep warm-rocm-cache` as a user-facing wrapper.
 
+`NEXT_PLAID_MIGRAPHX_WARM_CACHE=background` can start a separate helper process
+to warm missing fixed-shape caches while the current process keeps using CPU
+fallback for cold shapes. The cache marker is written only after the helper has
+validated the shape, so current-process inference will not consume partial MXR
+cache files. Background graph compilation is CPU-heavy, so it primarily prepares
+future runs and may compete with the active process for CPU resources.
+
 For workloads dominated by long documents, ROCm users can opt into a shorter
 document-token cap:
 

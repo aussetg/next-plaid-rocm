@@ -687,6 +687,19 @@ colgrep warm-rocm-cache
 colgrep warm-rocm-cache --model lightonai/LateOn-Code-edge
 ```
 
+During a forced ROCm indexing run, you can also ask ColGREP to start a
+separate low-level cache-warming process for missing shapes while the current
+process continues with CPU fallback for cold shapes:
+
+```bash
+NEXT_PLAID_MIGRAPHX_WARM_CACHE=background colgrep --force-gpu init .
+```
+
+Background warming is out-of-process so a MIGraphX compiler crash cannot take
+down the indexing process. It still uses CPU cores for graph compilation, so it
+is mainly useful to prepare later indexing/search runs rather than to guarantee
+a faster first run.
+
 For large repositories, you can opt into a ROCm-specific document-token cap to
 reduce indexing time and GPU memory use:
 
@@ -713,6 +726,8 @@ part of your workflow.
 | `NEXT_PLAID_MIGRAPHX_DOCUMENT_LENGTH`   | Optional ROCm/MIGraphX max document-token cap, e.g. `512`    |
 | `NEXT_PLAID_MIGRAPHX_STATIC_CACHE_ROOT` | Override fixed-shape MIGraphX cache directory                |
 | `NEXT_PLAID_MIGRAPHX_WARM_MAX_SEQUENCE_LEN` | Max sequence length warmed by `warm-rocm-cache`          |
+| `NEXT_PLAID_MIGRAPHX_WARM_CACHE`        | `background` starts a separate cache-warming process during ROCm runs; `blocking` warms synchronously |
+| `NEXT_PLAID_MIGRAPHX_BACKGROUND_WARM_MAX_SEQUENCE_LEN` | Max sequence length warmed by background ROCm cache warming |
 
 ---
 

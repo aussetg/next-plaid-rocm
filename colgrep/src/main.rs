@@ -23,6 +23,16 @@ use commands::{
 };
 
 fn main() -> Result<()> {
+    #[cfg(feature = "migraphx")]
+    {
+        if std::env::var_os("NEXT_PLAID_MIGRAPHX_WARMER_CHILD").is_some() {
+            colgrep::onnx_runtime::ensure_onnx_runtime()?;
+            if next_plaid_onnx::run_migraphx_warmer_child_if_requested()? {
+                return Ok(());
+            }
+        }
+    }
+
     // Set up Ctrl+C handler for graceful interruption during indexing
     // This is non-fatal if it fails (e.g., in environments without signal support)
     let _ = setup_signal_handler();

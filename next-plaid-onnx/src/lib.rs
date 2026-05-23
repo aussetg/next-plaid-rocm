@@ -61,6 +61,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Once;
@@ -1090,7 +1091,7 @@ struct MigraphxHybrid {
     model_cache_key: String,
     supported_shapes: HashSet<MigraphxStaticShape>,
     shape_models: Mutex<HashMap<MigraphxStaticShape, Colbert>>,
-    warming_shapes: Mutex<HashSet<MigraphxStaticShape>>,
+    background_warmer_started: Mutex<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2518,6 +2519,195 @@ fn default_migraphx_static_cache_root() -> Option<PathBuf> {
     })
 }
 
+const MIGRAPHX_WARMER_CHILD_ENV: &str = "NEXT_PLAID_MIGRAPHX_WARMER_CHILD";
+const MIGRAPHX_WARMER_MODEL_DIR_ENV: &str = "NEXT_PLAID_MIGRAPHX_WARMER_MODEL_DIR";
+const MIGRAPHX_WARMER_QUANTIZED_ENV: &str = "NEXT_PLAID_MIGRAPHX_WARMER_QUANTIZED";
+const MIGRAPHX_WARMER_QUERY_LENGTH_ENV: &str = "NEXT_PLAID_MIGRAPHX_WARMER_QUERY_LENGTH";
+const MIGRAPHX_WARMER_DOCUMENT_LENGTH_ENV: &str = "NEXT_PLAID_MIGRAPHX_WARMER_DOCUMENT_LENGTH";
+const MIGRAPHX_WARMER_CACHE_ROOT_ENV: &str = "NEXT_PLAID_MIGRAPHX_WARMER_CACHE_ROOT";
+const MIGRAPHX_WARMER_MODEL_CACHE_KEY_ENV: &str = "NEXT_PLAID_MIGRAPHX_WARMER_MODEL_CACHE_KEY";
+const MIGRAPHX_WARMER_SHAPES_ENV: &str = "NEXT_PLAID_MIGRAPHX_WARMER_SHAPES";
+
+#[cfg(feature = "migraphx")]
+fn parse_bool_env_value(value: &str) -> bool {
+    let value = value.trim();
+    !(value.is_empty()
+        || value == "0"
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("off"))
+}
+
+#[cfg(feature = "migraphx")]
+fn parse_migraphx_static_shape(value: &str) -> Result<MigraphxStaticShape> {
+    let value = value.trim();
+    let Some((batch_size, sequence_length)) = value.split_once('x') else {
+        anyhow::bail!("invalid MIGraphX static shape '{value}', expected BxS");
+    };
+    let batch_size = batch_size
+        .parse::<usize>()
+        .with_context(|| format!("invalid MIGraphX static shape batch size in '{value}'"))?;
+    let sequence_length = sequence_length
+        .parse::<usize>()
+        .with_context(|| format!("invalid MIGraphX static shape sequence length in '{value}'"))?;
+    if batch_size == 0 || sequence_length == 0 {
+        anyhow::bail!("invalid MIGraphX static shape '{value}', dimensions must be non-zero");
+    }
+    Ok(MigraphxStaticShape {
+        batch_size,
+        sequence_length,
+    })
+}
+
+#[cfg(feature = "migraphx")]
+fn parse_migraphx_static_shape_list(value: &str) -> Result<Vec<MigraphxStaticShape>> {
+    value
+        .split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(parse_migraphx_static_shape)
+        .collect()
+}
+
+fn write_migraphx_validation_marker(marker_path: &Path, shape: MigraphxStaticShape) -> Result<()> {
+    fs::write(
+        marker_path,
+        format!(
+            "validated-v1\nshape={}x{}\n",
+            shape.batch_size, shape.sequence_length
+        ),
+    )
+    .context("Failed to write MIGraphX shape-cache validation marker")
+}
+
+fn dummy_prepared_batch_for_migraphx_shape(
+    config: &ColbertConfig,
+    shape: MigraphxStaticShape,
+) -> PreparedDocumentBatch {
+    let element_count = shape.batch_size * shape.sequence_length;
+    let token_id = config.mask_token_id;
+    PreparedDocumentBatch {
+        batch_size: shape.batch_size,
+        tensor_batch_size: shape.batch_size,
+        batch_max_len: shape.sequence_length,
+        all_input_ids: vec![token_id as i64; element_count],
+        all_attention_mask: vec![1; element_count],
+        all_token_type_ids: if config.uses_token_type_ids {
+            Some(vec![0; element_count])
+        } else {
+            None
+        },
+        all_token_ids: vec![vec![token_id; shape.sequence_length]; shape.batch_size],
+        original_lengths: vec![shape.sequence_length; shape.batch_size],
+        is_query: false,
+        filter_skiplist: false,
+        original_input_indices: Vec::new(),
+    }
+}
+
+/// If this process was spawned as a MIGraphX background cache warmer, run the
+/// requested shape warmups and return `Ok(true)`. Binaries that want to support
+/// out-of-process background warming should call this before parsing their own
+/// CLI arguments.
+pub fn run_migraphx_warmer_child_if_requested() -> Result<bool> {
+    if std::env::var_os(MIGRAPHX_WARMER_CHILD_ENV).is_none() {
+        return Ok(false);
+    }
+
+    #[cfg(not(feature = "migraphx"))]
+    {
+        anyhow::bail!("MIGraphX warmer child requested, but MIGraphX support is not compiled");
+    }
+
+    #[cfg(feature = "migraphx")]
+    {
+        let model_dir = PathBuf::from(std::env::var(MIGRAPHX_WARMER_MODEL_DIR_ENV).with_context(
+            || format!("{MIGRAPHX_WARMER_MODEL_DIR_ENV} is required for MIGraphX warmer child"),
+        )?);
+        let quantized = std::env::var(MIGRAPHX_WARMER_QUANTIZED_ENV)
+            .map(|value| parse_bool_env_value(&value))
+            .unwrap_or(false);
+        let query_length = std::env::var(MIGRAPHX_WARMER_QUERY_LENGTH_ENV)
+            .with_context(|| {
+                format!("{MIGRAPHX_WARMER_QUERY_LENGTH_ENV} is required for MIGraphX warmer child")
+            })?
+            .parse::<usize>()
+            .context("invalid MIGraphX warmer query length")?;
+        let document_length = std::env::var(MIGRAPHX_WARMER_DOCUMENT_LENGTH_ENV)
+            .with_context(|| {
+                format!(
+                    "{MIGRAPHX_WARMER_DOCUMENT_LENGTH_ENV} is required for MIGraphX warmer child"
+                )
+            })?
+            .parse::<usize>()
+            .context("invalid MIGraphX warmer document length")?;
+        let cache_root = PathBuf::from(
+            std::env::var(MIGRAPHX_WARMER_CACHE_ROOT_ENV).with_context(|| {
+                format!("{MIGRAPHX_WARMER_CACHE_ROOT_ENV} is required for MIGraphX warmer child")
+            })?,
+        );
+        let model_cache_key =
+            std::env::var(MIGRAPHX_WARMER_MODEL_CACHE_KEY_ENV).with_context(|| {
+                format!(
+                    "{MIGRAPHX_WARMER_MODEL_CACHE_KEY_ENV} is required for MIGraphX warmer child"
+                )
+            })?;
+        let mut shapes = parse_migraphx_static_shape_list(
+            &std::env::var(MIGRAPHX_WARMER_SHAPES_ENV).with_context(|| {
+                format!("{MIGRAPHX_WARMER_SHAPES_ENV} is required for MIGraphX warmer child")
+            })?,
+        )?;
+        shapes.sort_by_key(|shape| (shape.sequence_length, shape.batch_size));
+
+        onnx_diag!(
+            "MIGraphX warmer child start model_dir={} shapes={:?}",
+            model_dir.display(),
+            shapes
+        );
+
+        for shape in shapes {
+            let cache_dir = cache_root
+                .join(&model_cache_key)
+                .join(shape.cache_dir_name());
+            let marker_path = cache_dir.join("validated-v1");
+            if marker_path.exists() && shape_cache_has_mxr(&cache_dir) {
+                onnx_diag!("MIGraphX warmer child skipping warm shape {:?}", shape);
+                continue;
+            }
+
+            fs::create_dir_all(&cache_dir).with_context(|| {
+                format!(
+                    "Failed to create MIGraphX cache directory {}",
+                    cache_dir.display()
+                )
+            })?;
+
+            onnx_diag!("MIGraphX warmer child warming shape {:?}", shape);
+            let model = ColbertBuilder::new(&model_dir)
+                .with_quantized(quantized)
+                .with_parallel(1)
+                .with_batch_size(shape.batch_size)
+                .with_dynamic_batch(false)
+                .with_query_length(query_length)
+                .with_document_length(document_length)
+                .with_execution_provider(ExecutionProvider::MIGraphX)
+                .with_migraphx_static_shape(shape.batch_size, shape.sequence_length)
+                .with_migraphx_model_cache_dir(&cache_dir)
+                .with_migraphx_cold_shape_cpu_fallback(false)
+                .build()
+                .with_context(|| format!("Failed to build MIGraphX warmer shape {:?}", shape))?;
+
+            let prepared = dummy_prepared_batch_for_migraphx_shape(model.config(), shape);
+            model
+                .encode_prepared_documents(prepared)
+                .with_context(|| format!("Failed to validate MIGraphX warmer shape {:?}", shape))?;
+            write_migraphx_validation_marker(&marker_path, shape)?;
+            onnx_diag!("MIGraphX warmer child warmed shape {:?}", shape);
+        }
+
+        onnx_diag!("MIGraphX warmer child done");
+        Ok(true)
+    }
+}
+
 fn cache_key_for_onnx(path: &Path, quantized: bool) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     quantized.hash(&mut hasher);
@@ -2875,7 +3065,7 @@ impl MigraphxHybrid {
             model_cache_key: cache_key_for_onnx(onnx_path, quantized),
             supported_shapes,
             shape_models: Mutex::new(HashMap::new()),
-            warming_shapes: Mutex::new(HashSet::new()),
+            background_warmer_started: Mutex::new(false),
         };
 
         onnx_diag!(
@@ -3018,25 +3208,7 @@ impl MigraphxHybrid {
     }
 
     fn dummy_prepared_batch(&self, shape: MigraphxStaticShape) -> PreparedDocumentBatch {
-        let element_count = shape.batch_size * shape.sequence_length;
-        let token_id = self.config.mask_token_id;
-        PreparedDocumentBatch {
-            batch_size: shape.batch_size,
-            tensor_batch_size: shape.batch_size,
-            batch_max_len: shape.sequence_length,
-            all_input_ids: vec![token_id as i64; element_count],
-            all_attention_mask: vec![1; element_count],
-            all_token_type_ids: if self.config.uses_token_type_ids {
-                Some(vec![0; element_count])
-            } else {
-                None
-            },
-            all_token_ids: vec![vec![token_id; shape.sequence_length]; shape.batch_size],
-            original_lengths: vec![shape.sequence_length; shape.batch_size],
-            is_query: false,
-            filter_skiplist: false,
-            original_input_indices: Vec::new(),
-        }
+        dummy_prepared_batch_for_migraphx_shape(&self.config, shape)
     }
 
     fn warm_shape(&self, shape: MigraphxStaticShape) -> Result<()> {
@@ -3056,14 +3228,7 @@ impl MigraphxHybrid {
         model
             .encode_prepared_documents(prepared)
             .with_context(|| format!("Failed to validate MIGraphX static shape {:?}", shape))?;
-        fs::write(
-            self.marker_path(shape),
-            format!(
-                "validated-v1\nshape={}x{}\n",
-                shape.batch_size, shape.sequence_length
-            ),
-        )
-        .context("Failed to write MIGraphX shape-cache validation marker")?;
+        write_migraphx_validation_marker(&self.marker_path(shape), shape)?;
         self.shape_models.lock().unwrap().insert(shape, model);
         onnx_diag!("MIGraphX warmed static shape {:?}", shape);
         Ok(())
@@ -3072,6 +3237,81 @@ impl MigraphxHybrid {
     fn should_background_warm(&self, shape: MigraphxStaticShape) -> bool {
         self.is_supported_shape(shape)
             && shape.sequence_length <= default_migraphx_background_warm_max_sequence_len()
+    }
+
+    fn background_warm_shapes(&self) -> Vec<MigraphxStaticShape> {
+        let max_sequence_len = default_migraphx_background_warm_max_sequence_len();
+        let mut shapes: Vec<_> = self
+            .supported_shapes
+            .iter()
+            .copied()
+            .filter(|shape| shape.sequence_length <= max_sequence_len)
+            .collect();
+        shapes.sort_by_key(|shape| (shape.sequence_length, shape.batch_size));
+        shapes
+    }
+
+    fn spawn_background_warmer_process(&self) -> Result<()> {
+        let shapes = self.background_warm_shapes();
+        if shapes.is_empty() {
+            return Ok(());
+        }
+
+        let shapes_env = shapes
+            .iter()
+            .map(|shape| shape.cache_dir_name())
+            .collect::<Vec<_>>()
+            .join(",");
+        let exe = std::env::current_exe().context("Failed to locate current executable")?;
+        onnx_diag!(
+            "spawning MIGraphX background warmer process exe={} shapes={}",
+            exe.display(),
+            shapes_env
+        );
+
+        Command::new(exe)
+            .env(MIGRAPHX_WARMER_CHILD_ENV, "1")
+            .env(MIGRAPHX_WARMER_MODEL_DIR_ENV, &self.model_dir)
+            .env(
+                MIGRAPHX_WARMER_QUANTIZED_ENV,
+                if self.quantized { "1" } else { "0" },
+            )
+            .env(
+                MIGRAPHX_WARMER_QUERY_LENGTH_ENV,
+                self.query_length.to_string(),
+            )
+            .env(
+                MIGRAPHX_WARMER_DOCUMENT_LENGTH_ENV,
+                self.document_length.to_string(),
+            )
+            .env(MIGRAPHX_WARMER_CACHE_ROOT_ENV, &self.cache_root)
+            .env(MIGRAPHX_WARMER_MODEL_CACHE_KEY_ENV, &self.model_cache_key)
+            .env(MIGRAPHX_WARMER_SHAPES_ENV, shapes_env)
+            .env("NEXT_PLAID_MIGRAPHX_WARM_CACHE", "off")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Failed to spawn MIGraphX background warmer process")?;
+        Ok(())
+    }
+
+    fn maybe_spawn_background_warmer_process(&self, trigger_shape: MigraphxStaticShape) {
+        if !self.should_background_warm(trigger_shape) {
+            return;
+        }
+
+        {
+            let mut started = self.background_warmer_started.lock().unwrap();
+            if *started {
+                return;
+            }
+            *started = true;
+        }
+
+        if let Err(err) = self.spawn_background_warmer_process() {
+            onnx_diag!("MIGraphX background warmer process spawn failed: {err:#}");
+        }
     }
 
     fn maybe_warm_shape(self: &Arc<Self>, shape: MigraphxStaticShape) -> Result<()> {
@@ -3083,26 +3323,7 @@ impl MigraphxHybrid {
             MigraphxWarmPolicy::Off => Ok(()),
             MigraphxWarmPolicy::Blocking => self.warm_shape(shape),
             MigraphxWarmPolicy::Background => {
-                if !self.should_background_warm(shape) {
-                    return Ok(());
-                }
-
-                {
-                    let mut warming = self.warming_shapes.lock().unwrap();
-                    if !warming.insert(shape) {
-                        return Ok(());
-                    }
-                }
-
-                let this = Arc::clone(self);
-                let _ = std::thread::Builder::new()
-                    .name(format!("migraphx-warm-{}", shape.cache_dir_name()))
-                    .spawn(move || {
-                        if let Err(err) = this.warm_shape(shape) {
-                            onnx_diag!("MIGraphX background warm failed for {:?}: {err:#}", shape);
-                        }
-                        this.warming_shapes.lock().unwrap().remove(&shape);
-                    });
+                self.maybe_spawn_background_warmer_process(shape);
                 Ok(())
             }
         }
@@ -4342,6 +4563,31 @@ mod tests {
         assert!(!can_pad_migraphx_warm_tail_rows_with_factor(7, 7, 2));
         assert!(!can_pad_migraphx_warm_tail_rows_with_factor(7, 16, 2));
         assert!(!can_pad_migraphx_warm_tail_rows_with_factor(0, 16, 2));
+    }
+
+    #[cfg(feature = "migraphx")]
+    #[test]
+    fn test_parse_migraphx_static_shape_list() {
+        let shapes = parse_migraphx_static_shape_list("16x128,8x256, 4x512").unwrap();
+        assert_eq!(
+            shapes,
+            vec![
+                MigraphxStaticShape {
+                    batch_size: 16,
+                    sequence_length: 128
+                },
+                MigraphxStaticShape {
+                    batch_size: 8,
+                    sequence_length: 256
+                },
+                MigraphxStaticShape {
+                    batch_size: 4,
+                    sequence_length: 512
+                }
+            ]
+        );
+        assert!(parse_migraphx_static_shape_list("16:128").is_err());
+        assert!(parse_migraphx_static_shape_list("0x128").is_err());
     }
 
     // =========================================================================
