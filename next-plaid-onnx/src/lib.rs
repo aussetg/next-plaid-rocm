@@ -1460,6 +1460,26 @@ impl ColbertBuilder {
             provider => provider.is_gpu(),
         };
 
+        // Determine batch size before session creation because MIGraphX hybrid
+        // mode needs it to derive the supported static-shape set. In hybrid
+        // mode the top-level model is only a router: actual work runs on
+        // lazily-created static MIGraphX child sessions or CPU fallback
+        // sessions, so creating a dynamic parent MIGraphX session is pure
+        // startup overhead.
+        let batch_size = self.batch_size.unwrap_or(if self.num_sessions > 1 {
+            2 // Small batches optimal for parallel sessions
+        } else if gpu_execution_requested {
+            DEFAULT_GPU_BATCH_SIZE
+        } else {
+            DEFAULT_CPU_BATCH_SIZE
+        });
+
+        let migraphx_hybrid_enabled = should_enable_migraphx_cold_shape_cpu_fallback(
+            requested_execution_provider,
+            migraphx_static_shape,
+            migraphx_cold_shape_cpu_fallback,
+        );
+
         // For GPU execution, cap intra-op threads to 1 — the GPU handles parallelism
         // and extra threads only cause ORT to allocate per-thread CUDA workspace buffers,
         // wasting GPU memory. The high thread count only benefits CPU sessions.
@@ -1469,86 +1489,86 @@ impl ColbertBuilder {
             self.threads_per_session
         };
 
-        let mut sessions = Vec::with_capacity(self.num_sessions);
-        for i in 0..self.num_sessions {
-            let session_start = Instant::now();
-            let builder = Session::builder()
-                .map_err(|e| anyhow::anyhow!("Failed to create ONNX session builder: {e:?}"))?
-                .with_optimization_level(GraphOptimizationLevel::Level3)
-                .map_err(|e| anyhow::anyhow!("Failed to set ONNX optimization level: {e:?}"))?
-                .with_intra_threads(threads_per_session)
-                .map_err(|e| anyhow::anyhow!("Failed to set ONNX intra-op threads: {e:?}"))?
-                .with_inter_threads(if self.num_sessions > 1 { 1 } else { 2 })
-                .map_err(|e| anyhow::anyhow!("Failed to set ONNX inter-op threads: {e:?}"))?;
-            let builder = if let Some(shape) = migraphx_static_shape {
-                builder
-                    .with_dimension_override("batch_size", shape.batch_size as i64)
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to set MIGraphX static batch dimension: {e:?}")
-                    })?
-                    .with_dimension_override("sequence_length", shape.sequence_length as i64)
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to set MIGraphX static sequence dimension: {e:?}")
-                    })?
-            } else {
-                builder
-            };
-            // Disable memory pattern optimization for all providers.
-            // On CPU this helps with variable-length sequences (~7% speedup).
-            // On GPU this prevents ORT from pre-allocating a large memory arena
-            // that can cause OOM on GPUs with limited free memory.
-            let builder = builder
-                .with_memory_pattern(false)
-                .map_err(|e| anyhow::anyhow!("Failed to configure ONNX memory pattern: {e:?}"))?;
-
-            let builder = configure_execution_provider_with_options(
-                builder,
-                self.execution_provider,
-                migraphx_model_cache_dir.as_deref(),
-            )?;
-
-            let commit_start = Instant::now();
+        let sessions = if migraphx_hybrid_enabled {
             onnx_diag!(
-                "session {i} commit start provider={} onnx={}",
+                "MIGraphX hybrid shell skipping dynamic parent session creation provider={} onnx={}",
                 self.execution_provider.display_name(),
                 onnx_path.display()
             );
-            let session = builder
-                .commit_from_file(&onnx_path)
-                .context("Failed to load ONNX model")?;
-            onnx_diag!(
-                "session {i} commit done commit_ms={:.3} session_total_ms={:.3}",
-                elapsed_ms(commit_start),
-                elapsed_ms(session_start)
-            );
-
-            sessions.push(Arc::new(Mutex::new(session)));
-        }
-
-        // Determine batch size
-        let batch_size = self.batch_size.unwrap_or(if self.num_sessions > 1 {
-            2 // Small batches optimal for parallel sessions
-        } else if gpu_execution_requested {
-            DEFAULT_GPU_BATCH_SIZE
+            Vec::new()
         } else {
-            DEFAULT_CPU_BATCH_SIZE
-        });
+            let mut sessions = Vec::with_capacity(self.num_sessions);
+            for i in 0..self.num_sessions {
+                let session_start = Instant::now();
+                let builder = Session::builder()
+                    .map_err(|e| anyhow::anyhow!("Failed to create ONNX session builder: {e:?}"))?
+                    .with_optimization_level(GraphOptimizationLevel::Level3)
+                    .map_err(|e| anyhow::anyhow!("Failed to set ONNX optimization level: {e:?}"))?
+                    .with_intra_threads(threads_per_session)
+                    .map_err(|e| anyhow::anyhow!("Failed to set ONNX intra-op threads: {e:?}"))?
+                    .with_inter_threads(if self.num_sessions > 1 { 1 } else { 2 })
+                    .map_err(|e| anyhow::anyhow!("Failed to set ONNX inter-op threads: {e:?}"))?;
+                let builder = if let Some(shape) = migraphx_static_shape {
+                    builder
+                        .with_dimension_override("batch_size", shape.batch_size as i64)
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to set MIGraphX static batch dimension: {e:?}")
+                        })?
+                        .with_dimension_override("sequence_length", shape.sequence_length as i64)
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Failed to set MIGraphX static sequence dimension: {e:?}"
+                            )
+                        })?
+                } else {
+                    builder
+                };
+                // Disable memory pattern optimization for all providers.
+                // On CPU this helps with variable-length sequences (~7% speedup).
+                // On GPU this prevents ORT from pre-allocating a large memory arena
+                // that can cause OOM on GPUs with limited free memory.
+                let builder = builder.with_memory_pattern(false).map_err(|e| {
+                    anyhow::anyhow!("Failed to configure ONNX memory pattern: {e:?}")
+                })?;
+
+                let builder = configure_execution_provider_with_options(
+                    builder,
+                    self.execution_provider,
+                    migraphx_model_cache_dir.as_deref(),
+                )?;
+
+                let commit_start = Instant::now();
+                onnx_diag!(
+                    "session {i} commit start provider={} onnx={}",
+                    self.execution_provider.display_name(),
+                    onnx_path.display()
+                );
+                let session = builder
+                    .commit_from_file(&onnx_path)
+                    .context("Failed to load ONNX model")?;
+                onnx_diag!(
+                    "session {i} commit done commit_ms={:.3} session_total_ms={:.3}",
+                    elapsed_ms(commit_start),
+                    elapsed_ms(session_start)
+                );
+
+                sessions.push(Arc::new(Mutex::new(session)));
+            }
+            sessions
+        };
         onnx_diag!(
-            "build done total_ms={:.3} effective_batch_size={} gpu_execution_requested={}",
+            "build done total_ms={:.3} effective_batch_size={} gpu_execution_requested={} sessions={}",
             elapsed_ms(build_start),
             batch_size,
-            gpu_execution_requested
+            gpu_execution_requested,
+            sessions.len()
         );
 
         let tokenizer = Arc::new(tokenizer);
         let config = Arc::new(config);
         let skiplist_ids = Arc::new(skiplist_ids);
 
-        let migraphx_hybrid = if should_enable_migraphx_cold_shape_cpu_fallback(
-            requested_execution_provider,
-            migraphx_static_shape,
-            migraphx_cold_shape_cpu_fallback,
-        ) {
+        let migraphx_hybrid = if migraphx_hybrid_enabled {
             let cache_root = default_migraphx_static_cache_root().ok_or_else(|| {
                 anyhow::anyhow!(
                     "Failed to determine MIGraphX static-shape cache directory. Set NEXT_PLAID_MIGRAPHX_STATIC_CACHE_ROOT."
@@ -1819,6 +1839,14 @@ impl Colbert {
         &self,
         prepared: PreparedDocumentBatch,
     ) -> Result<Vec<Array2<f32>>> {
+        if let Some(hybrid) = &self.migraphx_hybrid {
+            return hybrid.encode_one_prepared(prepared);
+        }
+
+        if self.sessions.is_empty() {
+            anyhow::bail!("ColBERT model has no ONNX sessions available for encoding");
+        }
+
         let session_idx =
             self.next_session_idx.fetch_add(1, Ordering::Relaxed) % self.sessions.len().max(1);
         let mut session = self.sessions[session_idx].lock().unwrap();
@@ -1875,6 +1903,10 @@ impl Colbert {
         &self,
         prepared_batches: Vec<PreparedDocumentBatch>,
     ) -> Result<Vec<Array2<f32>>> {
+        if self.sessions.is_empty() {
+            anyhow::bail!("ColBERT model has no ONNX sessions available for encoding");
+        }
+
         if self.sessions.len() <= 1 || prepared_batches.len() == 1 {
             let mut all_embeddings = Vec::new();
             for prepared_batch in prepared_batches {
@@ -1963,6 +1995,31 @@ impl Colbert {
             return Ok(RawDocumentEmbeddingStream {
                 receiver: rx,
                 handles: Vec::new(),
+            });
+        }
+
+        if self.migraphx_hybrid.is_some() {
+            let model = self.clone();
+            let (raw_tx, raw_rx) = mpsc::channel::<Result<RawDocumentEmbeddingChunk>>();
+            let handle = std::thread::Builder::new()
+                .name("next-plaid-hybrid-stream".to_string())
+                .spawn(move || {
+                    let refs: Vec<&str> = documents.iter().map(String::as_str).collect();
+                    let result = model.encode_documents_raw(&refs).map(|embeddings| {
+                        RawDocumentEmbeddingChunk {
+                            chunk_index: 0,
+                            start_offset: 0,
+                            embeddings,
+                        }
+                    });
+
+                    let _ = raw_tx.send(result);
+                })
+                .expect("failed to spawn next-plaid hybrid stream worker");
+
+            return Ok(RawDocumentEmbeddingStream {
+                receiver: raw_rx,
+                handles: vec![handle],
             });
         }
 
