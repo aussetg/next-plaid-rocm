@@ -47,6 +47,14 @@ DEFAULT_WORK_DIR = Path(tempfile.gettempdir()) / "colgrep-reference-bench"
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "colgrep_reference_benchmark.json"
 MAX_OUTPUT_CHARS = 200_000
 
+# Default acceptance criteria for reference-vs-candidate runs. These are meant
+# to catch correctness regressions and severe performance cliffs while allowing
+# small rank differences between colgrep versions/backends.
+DEFAULT_MIN_MEAN_FILE_OVERLAP_AT_K = 0.90
+DEFAULT_MIN_TOP1_FILE_MATCH_RATE = 0.80
+DEFAULT_MAX_QUERY_GEOMEAN_SLOWDOWN = 2.0
+DEFAULT_MAX_INDEXING_SLOWDOWN = 2.0
+
 DEFAULT_QUERIES: list[dict[str, Any]] = [
     {
         "name": "error-handling",
@@ -462,6 +470,159 @@ def geometric_mean(values: list[float]) -> float | None:
     return math.exp(sum(math.log(v) for v in positive) / len(positive))
 
 
+def slowdown_from_speedup(value: float | None) -> float | None:
+    if value is None or value <= 0:
+        return None
+    return 1.0 / value
+
+
+def iter_command_dicts(summary: dict[str, Any]):
+    indexing = summary.get("indexing") or {}
+    for label in ("reference", "candidate"):
+        if indexing.get(label) is not None:
+            yield indexing[label]
+
+    incremental = summary.get("incremental") or {}
+    for label in ("reference", "candidate"):
+        if incremental.get(label) is not None:
+            yield incremental[label]
+
+    for query in summary.get("queries", []):
+        for label in ("reference", "candidate"):
+            query_side = query.get(label, {})
+            yield from query_side.get("warmups", [])
+            yield from query_side.get("runs", [])
+
+
+def count_parse_errors(summary: dict[str, Any]) -> int:
+    count = 0
+    for query in summary.get("queries", []):
+        for label in ("reference", "candidate"):
+            if query.get(label, {}).get("parse_error") is not None:
+                count += 1
+    return count
+
+
+def count_timeouts(summary: dict[str, Any]) -> int:
+    return sum(1 for run in iter_command_dicts(summary) if run.get("timed_out"))
+
+
+def acceptance_check(
+    checks: list[dict[str, Any]],
+    *,
+    name: str,
+    passed: bool,
+    actual: Any,
+    expected: str,
+) -> None:
+    checks.append(
+        {
+            "name": name,
+            "passed": passed,
+            "actual": actual,
+            "expected": expected,
+        }
+    )
+
+
+def evaluate_acceptance(summary: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    metrics = {
+        "failures": summary["summary"].get("failures"),
+        "parse_error_count": count_parse_errors(summary),
+        "timeout_count": count_timeouts(summary),
+        "mean_file_overlap_at_k": summary["summary"].get("mean_file_overlap_at_k"),
+        "min_file_overlap_at_k": summary["summary"].get("min_file_overlap_at_k"),
+        "top1_file_match_rate": summary["summary"].get("top1_file_match_rate"),
+        "query_geomean_speedup": summary["summary"].get("query_geomean_speedup"),
+        "query_geomean_slowdown": slowdown_from_speedup(
+            summary["summary"].get("query_geomean_speedup")
+        ),
+        "indexing_speedup": summary["summary"].get("indexing_speedup"),
+        "indexing_slowdown": slowdown_from_speedup(summary["summary"].get("indexing_speedup")),
+    }
+    criteria = {
+        "max_failures": args.max_failures,
+        "max_parse_errors": args.max_parse_errors,
+        "max_timeouts": args.max_timeouts,
+        "min_mean_file_overlap_at_k": args.min_mean_file_overlap_at_k,
+        "min_top1_file_match_rate": args.min_top1_file_match_rate,
+        "max_query_geomean_slowdown": args.max_query_geomean_slowdown,
+        "max_indexing_slowdown": args.max_indexing_slowdown,
+    }
+
+    checks: list[dict[str, Any]] = []
+    acceptance_check(
+        checks,
+        name="hard_failures",
+        passed=(metrics["failures"] or 0) <= args.max_failures,
+        actual=metrics["failures"],
+        expected=f"<= {args.max_failures}",
+    )
+    acceptance_check(
+        checks,
+        name="json_parse_errors",
+        passed=metrics["parse_error_count"] <= args.max_parse_errors,
+        actual=metrics["parse_error_count"],
+        expected=f"<= {args.max_parse_errors}",
+    )
+    acceptance_check(
+        checks,
+        name="timeouts",
+        passed=metrics["timeout_count"] <= args.max_timeouts,
+        actual=metrics["timeout_count"],
+        expected=f"<= {args.max_timeouts}",
+    )
+
+    if args.min_mean_file_overlap_at_k > 0:
+        actual = metrics["mean_file_overlap_at_k"]
+        acceptance_check(
+            checks,
+            name="mean_file_overlap_at_k",
+            passed=actual is not None and actual >= args.min_mean_file_overlap_at_k,
+            actual=actual,
+            expected=f">= {args.min_mean_file_overlap_at_k:.3f}",
+        )
+
+    if args.min_top1_file_match_rate > 0:
+        actual = metrics["top1_file_match_rate"]
+        acceptance_check(
+            checks,
+            name="top1_file_match_rate",
+            passed=actual is not None and actual >= args.min_top1_file_match_rate,
+            actual=actual,
+            expected=f">= {args.min_top1_file_match_rate:.3f}",
+        )
+
+    if args.max_query_geomean_slowdown > 0:
+        actual = metrics["query_geomean_slowdown"]
+        acceptance_check(
+            checks,
+            name="query_geomean_slowdown",
+            passed=actual is not None and actual <= args.max_query_geomean_slowdown,
+            actual=actual,
+            expected=f"<= {args.max_query_geomean_slowdown:.3f}",
+        )
+
+    if summary.get("indexing") is not None and args.max_indexing_slowdown > 0:
+        actual = metrics["indexing_slowdown"]
+        acceptance_check(
+            checks,
+            name="indexing_slowdown",
+            passed=actual is not None and actual <= args.max_indexing_slowdown,
+            actual=actual,
+            expected=f"<= {args.max_indexing_slowdown:.3f}",
+        )
+
+    passed = all(check["passed"] for check in checks)
+    return {
+        "enforced": not args.no_enforce_acceptance,
+        "passed": passed,
+        "criteria": criteria,
+        "metrics": metrics,
+        "checks": checks,
+    }
+
+
 def compare_results(
     ref_results: list[Any], cand_results: list[Any], project: Path, top_k: int
 ) -> dict[str, Any]:
@@ -604,7 +765,25 @@ def print_summary(summary: dict[str, Any]) -> None:
     print(
         f"  mean file overlap@k:   {format_optional(summary['summary'].get('mean_file_overlap_at_k'))}"
     )
+    print(
+        f"  top-1 file match rate: {format_optional(summary['summary'].get('top1_file_match_rate'))}"
+    )
     print(f"  failures:              {summary['summary'].get('failures')}")
+
+    acceptance = summary.get("acceptance")
+    if acceptance:
+        status = "PASS" if acceptance.get("passed") else "FAIL"
+        suffix = "" if acceptance.get("enforced") else " (not enforced)"
+        print(f"  acceptance:            {status}{suffix}")
+        for check in acceptance.get("checks", []):
+            if not check.get("passed"):
+                print(
+                    "    - {name}: actual={actual} expected={expected}".format(
+                        name=check.get("name"),
+                        actual=check.get("actual"),
+                        expected=check.get("expected"),
+                    )
+                )
 
 
 def format_seconds(value: float | None) -> str:
@@ -697,6 +876,53 @@ def parse_args() -> argparse.Namespace:
         "--incremental",
         action="store_true",
         help="Also benchmark adding one temporary Rust file and re-running init",
+    )
+    parser.add_argument(
+        "--max-failures",
+        type=int,
+        default=0,
+        help="Maximum allowed hard failures (non-zero exit, timeout, or no successful query run)",
+    )
+    parser.add_argument(
+        "--max-parse-errors",
+        type=int,
+        default=0,
+        help="Maximum allowed JSON parse errors across reference and candidate query outputs",
+    )
+    parser.add_argument(
+        "--max-timeouts",
+        type=int,
+        default=0,
+        help="Maximum allowed command timeouts across init, warmup, and measured runs",
+    )
+    parser.add_argument(
+        "--min-mean-file-overlap-at-k",
+        type=float,
+        default=DEFAULT_MIN_MEAN_FILE_OVERLAP_AT_K,
+        help="Minimum mean file overlap@k between reference and candidate results",
+    )
+    parser.add_argument(
+        "--min-top1-file-match-rate",
+        type=float,
+        default=DEFAULT_MIN_TOP1_FILE_MATCH_RATE,
+        help="Minimum fraction of queries whose top-1 file matches the reference",
+    )
+    parser.add_argument(
+        "--max-query-geomean-slowdown",
+        type=float,
+        default=DEFAULT_MAX_QUERY_GEOMEAN_SLOWDOWN,
+        help="Maximum allowed geometric-mean query slowdown vs reference (2.0 = up to 2x slower)",
+    )
+    parser.add_argument(
+        "--max-indexing-slowdown",
+        type=float,
+        default=DEFAULT_MAX_INDEXING_SLOWDOWN,
+        help="Maximum allowed cold indexing slowdown vs reference (2.0 = up to 2x slower)",
+    )
+    parser.add_argument(
+        "--no-enforce-acceptance",
+        action="store_true",
+        help="Record acceptance checks but do not make acceptance failure affect the exit code",
     )
     return parser.parse_args()
 
@@ -835,6 +1061,7 @@ def main() -> int:
     query_summaries = []
     query_speedups = []
     file_overlaps = []
+    top1_file_matches = []
     for query in queries:
         name = query["name"]
         ref = reference_queries[name]
@@ -850,6 +1077,7 @@ def main() -> int:
         if comparison["median_speedup"] is not None:
             query_speedups.append(comparison["median_speedup"])
         file_overlaps.append(comparison["file_overlap_at_k"])
+        top1_file_matches.append(comparison["top1_file_match"])
 
         query_summaries.append(
             {
@@ -916,9 +1144,14 @@ def main() -> int:
             "mean_file_overlap_at_k": sum(file_overlaps) / len(file_overlaps)
             if file_overlaps
             else None,
+            "min_file_overlap_at_k": min(file_overlaps) if file_overlaps else None,
+            "top1_file_match_rate": sum(top1_file_matches) / len(top1_file_matches)
+            if top1_file_matches
+            else None,
             "failures": failures,
         },
     }
+    summary["acceptance"] = evaluate_acceptance(summary, args)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(summary, indent=2))
@@ -928,7 +1161,11 @@ def main() -> int:
     if args.cleanup_work_dir:
         shutil.rmtree(work_dir, ignore_errors=True)
 
-    return 1 if failures else 0
+    if failures:
+        return 1
+    if summary["acceptance"]["enforced"] and not summary["acceptance"]["passed"]:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
