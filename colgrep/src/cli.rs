@@ -180,6 +180,19 @@ NOTES:
     • Useful for pre-warming the index before searching
     • Subsequent searches will be fast since the index is already built";
 
+pub const WARM_ROCM_CACHE_HELP: &str = "\
+EXAMPLES:
+    # Precompile common ROCm/MIGraphX ONNX shapes for the current/default model
+    colgrep warm-rocm-cache
+
+    # Warm a specific model
+    colgrep warm-rocm-cache --model lightonai/LateOn-Code-edge
+
+NOTES:
+    • Warms fixed-shape MIGraphX caches used by --force-gpu
+    • Defaults to shapes up to sequence length 512
+    • Set NEXT_PLAID_MIGRAPHX_WARM_MAX_SEQUENCE_LEN=2048 to include long-document shapes";
+
 pub const CONFIG_HELP: &str = "\
 EXAMPLES:
     # Show current configuration
@@ -607,6 +620,14 @@ pub enum Commands {
         /// Use strict batch-size batching instead of fixed dynamic GPU batching
         #[arg(long = "static-batch")]
         static_batch: bool,
+    },
+
+    /// Precompile common ROCm/MIGraphX fixed-shape model caches
+    #[command(name = "warm-rocm-cache", after_help = WARM_ROCM_CACHE_HELP)]
+    WarmRocmCache {
+        /// ColBERT model HuggingFace ID or local path (uses saved preference if not specified)
+        #[arg(long)]
+        model: Option<String>,
     },
 
     /// View or set configuration options (default k, n values)

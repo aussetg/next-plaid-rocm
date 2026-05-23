@@ -19,7 +19,7 @@ use cli::{Cli, Commands};
 use commands::search::{resolve_pool_factor, resolve_top_k};
 use commands::{
     cmd_clear, cmd_config, cmd_init, cmd_reset_stats, cmd_search, cmd_session_hook, cmd_set_model,
-    cmd_stats, cmd_status, cmd_task_hook, cmd_update, InitOptions,
+    cmd_stats, cmd_status, cmd_task_hook, cmd_update, cmd_warm_rocm_cache, InitOptions,
 };
 
 fn main() -> Result<()> {
@@ -249,6 +249,7 @@ fn main() -> Result<()> {
             },
         ),
         Some(Commands::Update) => cmd_update(),
+        Some(Commands::WarmRocmCache { model }) => cmd_warm_rocm_cache(model.as_deref()),
         Some(Commands::Status { path }) => cmd_status(&path),
         Some(Commands::Clear { path, all }) => cmd_clear(&path, all),
         Some(Commands::SetModel { model }) => cmd_set_model(&model),
