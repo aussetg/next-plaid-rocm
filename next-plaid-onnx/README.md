@@ -119,6 +119,19 @@ latency, use fixed-shape caches and avoid compiling new shapes in the hot path.
 The ColBERT builder exposes this through the MIGraphX static-shape cache APIs,
 and ColGREP provides `colgrep warm-rocm-cache` as a user-facing wrapper.
 
+For warmed ROCm throughput, `NEXT_PLAID_MIGRAPHX_FP16=1` enables MIGraphX's
+`migraphx_fp16_enable` provider option:
+
+```bash
+NEXT_PLAID_MIGRAPHX_FP16=1 your-command
+```
+
+FP16 remains opt-in because it changes numerical precision. On the default
+LateOn-Code-edge model, local measurements showed FP16 as the fastest ROCm mode
+while still passing the ColGREP reference quality checks; semantic-only rankings
+did change slightly compared with FP32. MIGraphX FP8 did not improve speed in
+the same measurements.
+
 `NEXT_PLAID_MIGRAPHX_WARM_CACHE=background` can start a separate helper process
 to warm missing fixed-shape caches while the current process keeps using CPU
 fallback for cold shapes. The cache marker is written only after the helper has

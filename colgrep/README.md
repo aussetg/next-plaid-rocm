@@ -687,6 +687,19 @@ colgrep warm-rocm-cache
 colgrep warm-rocm-cache --model lightonai/LateOn-Code-edge
 ```
 
+For the best warmed ROCm indexing throughput, opt into MIGraphX FP16 mode:
+
+```bash
+NEXT_PLAID_MIGRAPHX_FP16=1 colgrep warm-rocm-cache
+NEXT_PLAID_MIGRAPHX_FP16=1 colgrep --force-gpu init .
+```
+
+FP16 is not enabled silently because it changes numerical precision. In local
+benchmarks it was the fastest ROCm mode and passed the reference quality suite,
+but semantic-only rankings differed slightly from FP32. MIGraphX FP8 did not
+improve speed for the default model in the same benchmarks, so it is not
+recommended.
+
 During a forced ROCm indexing run, you can also ask ColGREP to start a
 separate low-level cache-warming process for missing shapes while the current
 process continues with CPU fallback for cold shapes:
@@ -738,6 +751,7 @@ wrappers that can amortize that setup cost.
 | `XDG_CONFIG_HOME`                       | Override config directory                                    |
 | `HF_TOKEN`                              | HuggingFace token for private models                         |
 | `HUGGING_FACE_HUB_TOKEN`                | Alternative HF token variable                                |
+| `NEXT_PLAID_MIGRAPHX_FP16`              | Enable MIGraphX FP16 compilation (`1`/`true`); recommended opt-in ROCm performance mode after validating quality |
 | `NEXT_PLAID_MIGRAPHX_DOCUMENT_LENGTH`   | Optional ROCm/MIGraphX max document-token cap, e.g. `512`    |
 | `NEXT_PLAID_MIGRAPHX_QUERY_GPU`         | Opt into MIGraphX query embedding for search; defaults to CPU for one-shot CLI latency |
 | `NEXT_PLAID_MIGRAPHX_STATIC_CACHE_ROOT` | Override fixed-shape MIGraphX cache directory                |
