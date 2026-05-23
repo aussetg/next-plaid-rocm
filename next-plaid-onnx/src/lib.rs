@@ -1044,6 +1044,23 @@ impl MigraphxStaticShape {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct MigraphxStaticShapeCacheStatus {
+    pub cache_root: PathBuf,
+    pub model_cache_key: String,
+    pub document_shapes: Vec<MigraphxStaticShape>,
+    pub warm_document_shapes: Vec<MigraphxStaticShape>,
+    pub cold_document_shapes: Vec<MigraphxStaticShape>,
+    pub query_shape: MigraphxStaticShape,
+    pub query_shape_warm: bool,
+}
+
+impl MigraphxStaticShapeCacheStatus {
+    pub fn all_document_shapes_warm(&self) -> bool {
+        self.cold_document_shapes.is_empty()
+    }
+}
+
 /// Type alias for batch encoding data: (input_ids, attention_mask, token_type_ids, token_ids)
 /// ColBERT model for encoding documents and queries into multi-vector embeddings.
 ///
@@ -3006,6 +3023,92 @@ fn shape_cache_has_mxr(cache_dir: &Path) -> bool {
         .any(|entry| entry.path().extension().is_some_and(|ext| ext == "mxr"))
 }
 
+fn migraphx_shape_cache_is_warm(
+    cache_root: &Path,
+    model_cache_key: &str,
+    shape: MigraphxStaticShape,
+) -> bool {
+    let cache_dir = cache_root
+        .join(model_cache_key)
+        .join(shape.cache_dir_name());
+    cache_dir.join("validated-v1").exists() && shape_cache_has_mxr(&cache_dir)
+}
+
+/// Inspect fixed-shape MIGraphX caches for a model without creating ONNX
+/// sessions.
+///
+/// This is intended for higher-level auto-selection policy: callers can choose
+/// MIGraphX only when all document shapes have already been compiled and
+/// validated, avoiding cold graph-compilation stalls in interactive commands.
+pub fn migraphx_static_shape_cache_status<P: AsRef<Path>>(
+    model_dir: P,
+    quantized: bool,
+    batch_size: usize,
+) -> Result<MigraphxStaticShapeCacheStatus> {
+    let model_dir = model_dir.as_ref();
+    let onnx_path = select_onnx_file(model_dir, quantized)?;
+    let mut config = ColbertConfig::from_model_dir(model_dir)?;
+
+    if let Some(document_length) = migraphx_env_usize("NEXT_PLAID_MIGRAPHX_DOCUMENT_LENGTH") {
+        config.document_length = document_length.max(2);
+    }
+
+    let cache_root = default_migraphx_static_cache_root().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Failed to determine MIGraphX static-shape cache directory. Set NEXT_PLAID_MIGRAPHX_STATIC_CACHE_ROOT."
+        )
+    })?;
+    let model_cache_key = cache_key_for_onnx(&onnx_path, quantized);
+
+    let document_shapes: Vec<_> =
+        build_fixed_dynamic_shapes(batch_size.max(1), config.document_length)
+            .into_iter()
+            .map(|shape| MigraphxStaticShape {
+                batch_size: shape.docs,
+                sequence_length: shape.planned_len,
+            })
+            .collect();
+
+    let mut warm_document_shapes = Vec::new();
+    let mut cold_document_shapes = Vec::new();
+    for shape in &document_shapes {
+        if migraphx_shape_cache_is_warm(&cache_root, &model_cache_key, *shape) {
+            warm_document_shapes.push(*shape);
+        } else {
+            cold_document_shapes.push(*shape);
+        }
+    }
+
+    let query_shape = MigraphxStaticShape {
+        batch_size: 1,
+        sequence_length: config.query_length,
+    };
+    let query_shape_warm = migraphx_shape_cache_is_warm(&cache_root, &model_cache_key, query_shape);
+
+    Ok(MigraphxStaticShapeCacheStatus {
+        cache_root,
+        model_cache_key,
+        document_shapes,
+        warm_document_shapes,
+        cold_document_shapes,
+        query_shape,
+        query_shape_warm,
+    })
+}
+
+/// Return true when every document fixed-shape cache that MIGraphX indexing may
+/// use for this model/batch size is present and validated.
+pub fn migraphx_document_static_shape_caches_warm<P: AsRef<Path>>(
+    model_dir: P,
+    quantized: bool,
+    batch_size: usize,
+) -> Result<bool> {
+    Ok(
+        migraphx_static_shape_cache_status(model_dir, quantized, batch_size)?
+            .all_document_shapes_warm(),
+    )
+}
+
 fn restore_original_input_order(
     encoded: Vec<Array2<f32>>,
     combined_indices: Vec<usize>,
@@ -4916,6 +5019,79 @@ mod tests {
         );
         assert!(parse_migraphx_static_shape_list("16:128").is_err());
         assert!(parse_migraphx_static_shape_list("0x128").is_err());
+    }
+
+    #[test]
+    fn test_migraphx_static_shape_cache_status_tracks_warm_document_shapes() {
+        let unique = format!(
+            "next-plaid-cache-status-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let model_dir = root.join("model");
+        let cache_root = root.join("cache");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("model.onnx"), b"fake model").unwrap();
+        fs::write(
+            model_dir.join("onnx_config.json"),
+            r#"{"query_length":256,"document_length":512,"embedding_dim":48}"#,
+        )
+        .unwrap();
+
+        let old_cache_root = std::env::var("NEXT_PLAID_MIGRAPHX_STATIC_CACHE_ROOT").ok();
+        let old_doc_len = std::env::var("NEXT_PLAID_MIGRAPHX_DOCUMENT_LENGTH").ok();
+        std::env::set_var("NEXT_PLAID_MIGRAPHX_STATIC_CACHE_ROOT", &cache_root);
+        std::env::remove_var("NEXT_PLAID_MIGRAPHX_DOCUMENT_LENGTH");
+
+        let status = migraphx_static_shape_cache_status(&model_dir, false, 1).unwrap();
+        assert_eq!(
+            status.document_shapes,
+            vec![
+                MigraphxStaticShape {
+                    batch_size: 4,
+                    sequence_length: 128
+                },
+                MigraphxStaticShape {
+                    batch_size: 2,
+                    sequence_length: 256
+                },
+                MigraphxStaticShape {
+                    batch_size: 1,
+                    sequence_length: 512
+                }
+            ]
+        );
+        assert!(!status.all_document_shapes_warm());
+        assert_eq!(status.warm_document_shapes.len(), 0);
+        assert_eq!(status.cold_document_shapes.len(), 3);
+
+        let warm_shape = status.document_shapes[0];
+        let warm_dir = cache_root
+            .join(&status.model_cache_key)
+            .join(warm_shape.cache_dir_name());
+        fs::create_dir_all(&warm_dir).unwrap();
+        fs::write(warm_dir.join("validated-v1"), b"validated").unwrap();
+        fs::write(warm_dir.join("fake.mxr"), b"mxr").unwrap();
+
+        let status = migraphx_static_shape_cache_status(&model_dir, false, 1).unwrap();
+        assert_eq!(status.warm_document_shapes, vec![warm_shape]);
+        assert_eq!(status.cold_document_shapes.len(), 2);
+
+        if let Some(value) = old_cache_root {
+            std::env::set_var("NEXT_PLAID_MIGRAPHX_STATIC_CACHE_ROOT", value);
+        } else {
+            std::env::remove_var("NEXT_PLAID_MIGRAPHX_STATIC_CACHE_ROOT");
+        }
+        if let Some(value) = old_doc_len {
+            std::env::set_var("NEXT_PLAID_MIGRAPHX_DOCUMENT_LENGTH", value);
+        } else {
+            std::env::remove_var("NEXT_PLAID_MIGRAPHX_DOCUMENT_LENGTH");
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(all(feature = "migraphx", target_os = "linux"))]

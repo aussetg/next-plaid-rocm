@@ -67,6 +67,13 @@ const DEFAULT_ENCODE_BATCH_SIZE: usize = 64;
 /// Threshold for forcing CPU encoding even when a GPU provider is available.
 /// For small batches (< this many units), CPU is faster due to GPU initialization overhead.
 const SMALL_BATCH_CPU_THRESHOLD: usize = 300;
+
+/// Minimum number of code units before auto mode may choose warm ROCm/MIGraphX
+/// indexing. Below this, CPU wins even with fully warmed shape caches because
+/// MIGraphX static-session setup overhead dominates one-shot CLI runs.
+const MIGRAPHX_AUTO_INDEX_MIN_UNITS: usize = 2_000;
+const MIGRAPHX_AUTO_INDEX_ENV: &str = "NEXT_PLAID_MIGRAPHX_AUTO_INDEX";
+const MIGRAPHX_AUTO_INDEX_MIN_UNITS_ENV: &str = "NEXT_PLAID_MIGRAPHX_AUTO_INDEX_MIN_UNITS";
 /// Bounded channel capacity between the pool and index stages.
 /// Kept small (4 chunks) to limit memory: each chunk holds full embeddings
 /// waiting to be written to disk. Back-pressure here slows encoding when
@@ -278,6 +285,59 @@ fn prepare_deduplicated_chunk(unit_chunk: &[SortedUnit]) -> PreparedChunk {
         unique_texts,
         original_to_unique,
     }
+}
+
+fn truthy_env_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn falsey_env_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
+}
+
+fn migraphx_auto_indexing_enabled_from_value(value: Option<&str>) -> bool {
+    value.map(|value| !falsey_env_value(value)).unwrap_or(true)
+}
+
+fn migraphx_auto_indexing_enabled() -> bool {
+    migraphx_auto_indexing_enabled_from_value(
+        std::env::var(MIGRAPHX_AUTO_INDEX_ENV).ok().as_deref(),
+    )
+}
+
+fn migraphx_auto_index_min_units_from_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|units| *units > 0)
+        .unwrap_or(MIGRAPHX_AUTO_INDEX_MIN_UNITS)
+}
+
+fn migraphx_auto_index_min_units() -> usize {
+    migraphx_auto_index_min_units_from_value(
+        std::env::var(MIGRAPHX_AUTO_INDEX_MIN_UNITS_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn should_auto_use_warm_migraphx_for_indexing(
+    model_path: &Path,
+    quantized: bool,
+    batch_size: usize,
+    num_units: usize,
+) -> bool {
+    if !migraphx_auto_indexing_enabled() || num_units < migraphx_auto_index_min_units() {
+        return false;
+    }
+
+    next_plaid_onnx::migraphx_document_static_shape_caches_warm(model_path, quantized, batch_size)
+        .unwrap_or(false)
 }
 
 fn run_encode_stage(
@@ -912,19 +972,41 @@ impl IndexBuilder {
                         .context("Failed to initialize ONNX Runtime")?;
 
                     if !force_cpu_for_small_batch {
-                        // ROCm/MIGraphX is available for explicit --force-gpu,
-                        // but it is currently a poor automatic choice for
-                        // ColGREP indexing: dynamic code-unit shapes trigger
-                        // tens of seconds of cold MIGraphX compilation. Keep
-                        // auto mode on CPU unless another GPU EP is available.
-                        if let Some(provider) = preferred_colgrep_gpu_provider()
-                            .filter(|provider| *provider != ExecutionProvider::MIGraphX)
-                        {
-                            (
-                                self.parallel_sessions
-                                    .unwrap_or(crate::config::DEFAULT_PARALLEL_SESSIONS_GPU),
-                                provider,
-                            )
+                        if let Some(provider) = preferred_colgrep_gpu_provider() {
+                            if provider == ExecutionProvider::MIGraphX {
+                                let migraphx_batch = self
+                                    .batch_size
+                                    .unwrap_or(crate::config::DEFAULT_BATCH_SIZE_MIGRAPHX);
+                                if should_auto_use_warm_migraphx_for_indexing(
+                                    &self.model_path,
+                                    self.quantized,
+                                    migraphx_batch,
+                                    num_units,
+                                ) {
+                                    eprintln!(
+                                        "ℹ️  Warm ROCm/MIGraphX caches detected; auto mode using GPU inference for indexing."
+                                    );
+                                    (
+                                        self.parallel_sessions.unwrap_or(
+                                            crate::config::DEFAULT_PARALLEL_SESSIONS_GPU,
+                                        ),
+                                        provider,
+                                    )
+                                } else {
+                                    (
+                                        self.parallel_sessions.unwrap_or_else(
+                                            crate::config::get_default_cpu_parallel_sessions,
+                                        ),
+                                        ExecutionProvider::Cpu,
+                                    )
+                                }
+                            } else {
+                                (
+                                    self.parallel_sessions
+                                        .unwrap_or(crate::config::DEFAULT_PARALLEL_SESSIONS_GPU),
+                                    provider,
+                                )
+                            }
                         } else {
                             (
                                 self.parallel_sessions.unwrap_or_else(
@@ -2923,14 +3005,7 @@ pub struct Searcher {
 const MIGRAPHX_QUERY_GPU_ENV: &str = "NEXT_PLAID_MIGRAPHX_QUERY_GPU";
 
 fn migraphx_query_gpu_enabled_from_value(value: Option<&str>) -> bool {
-    value
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    value.map(truthy_env_value).unwrap_or(false)
 }
 
 fn migraphx_query_gpu_enabled() -> bool {
@@ -3928,6 +4003,34 @@ mod tests {
         assert!(migraphx_query_gpu_enabled_from_value(Some("true")));
         assert!(migraphx_query_gpu_enabled_from_value(Some("YES")));
         assert!(migraphx_query_gpu_enabled_from_value(Some(" on ")));
+    }
+
+    #[test]
+    fn test_migraphx_auto_index_env_parsers() {
+        assert!(migraphx_auto_indexing_enabled_from_value(None));
+        assert!(migraphx_auto_indexing_enabled_from_value(Some("1")));
+        assert!(migraphx_auto_indexing_enabled_from_value(Some("true")));
+        assert!(migraphx_auto_indexing_enabled_from_value(Some(
+            "unexpected"
+        )));
+        assert!(!migraphx_auto_indexing_enabled_from_value(Some("")));
+        assert!(!migraphx_auto_indexing_enabled_from_value(Some("0")));
+        assert!(!migraphx_auto_indexing_enabled_from_value(Some("false")));
+        assert!(!migraphx_auto_indexing_enabled_from_value(Some(" off ")));
+
+        assert_eq!(
+            migraphx_auto_index_min_units_from_value(None),
+            MIGRAPHX_AUTO_INDEX_MIN_UNITS
+        );
+        assert_eq!(migraphx_auto_index_min_units_from_value(Some("2048")), 2048);
+        assert_eq!(
+            migraphx_auto_index_min_units_from_value(Some("0")),
+            MIGRAPHX_AUTO_INDEX_MIN_UNITS
+        );
+        assert_eq!(
+            migraphx_auto_index_min_units_from_value(Some("not-a-number")),
+            MIGRAPHX_AUTO_INDEX_MIN_UNITS
+        );
     }
 
     #[test]

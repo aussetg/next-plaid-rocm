@@ -118,6 +118,11 @@ MIGraphX compiles optimized GPU programs per input shape. For best CLI-style
 latency, use fixed-shape caches and avoid compiling new shapes in the hot path.
 The ColBERT builder exposes this through the MIGraphX static-shape cache APIs,
 and ColGREP provides `colgrep warm-rocm-cache` as a user-facing wrapper.
+Applications that want safe auto-selection can inspect
+`migraphx_static_shape_cache_status()` or
+`migraphx_document_static_shape_caches_warm()` before choosing MIGraphX; this
+lets cold or incomplete shape caches stay on CPU while fully warmed workloads
+use ROCm.
 
 For warmed ROCm throughput, `NEXT_PLAID_MIGRAPHX_FP16=1` enables MIGraphX's
 `migraphx_fp16_enable` provider option:
@@ -192,6 +197,26 @@ impl ColbertBuilder {
     pub fn build(self) -> Result<Colbert>;
 }
 ```
+
+#### MIGraphX cache helpers
+
+```rust
+pub fn migraphx_static_shape_cache_status(
+    model_dir: impl AsRef<Path>,
+    quantized: bool,
+    batch_size: usize,
+) -> Result<MigraphxStaticShapeCacheStatus>;
+
+pub fn migraphx_document_static_shape_caches_warm(
+    model_dir: impl AsRef<Path>,
+    quantized: bool,
+    batch_size: usize,
+) -> Result<bool>;
+```
+
+These inspect per-shape validation markers and MXR files without creating ONNX
+sessions, so callers can route fully warmed ROCm workloads to MIGraphX and keep
+cold/incomplete workloads on CPU.
 
 #### `ExecutionProvider`
 

@@ -687,6 +687,14 @@ colgrep warm-rocm-cache
 colgrep warm-rocm-cache --model lightonai/LateOn-Code-edge
 ```
 
+In auto mode, ColGREP keeps small projects on CPU, but it can now select
+ROCm/MIGraphX automatically for larger indexing runs when all document
+fixed-shape caches for the active model, precision, batch size, and provider
+options are already warm and validated. This avoids the original cold-compile
+stall while letting large warmed indexes benefit from GPU inference. Use
+`NEXT_PLAID_MIGRAPHX_AUTO_INDEX=0` to disable this policy, or adjust the size
+gate with `NEXT_PLAID_MIGRAPHX_AUTO_INDEX_MIN_UNITS`.
+
 For the best warmed ROCm indexing throughput, opt into MIGraphX FP16 mode:
 
 ```bash
@@ -754,6 +762,8 @@ wrappers that can amortize that setup cost.
 | `NEXT_PLAID_MIGRAPHX_FP16`              | Enable MIGraphX FP16 compilation (`1`/`true`); recommended opt-in ROCm performance mode after validating quality |
 | `NEXT_PLAID_MIGRAPHX_DOCUMENT_LENGTH`   | Optional ROCm/MIGraphX max document-token cap, e.g. `512`    |
 | `NEXT_PLAID_MIGRAPHX_QUERY_GPU`         | Opt into MIGraphX query embedding for search; defaults to CPU for one-shot CLI latency |
+| `NEXT_PLAID_MIGRAPHX_AUTO_INDEX`        | Set `0`/`false`/`off` to stop auto mode from selecting warm ROCm/MIGraphX indexing caches |
+| `NEXT_PLAID_MIGRAPHX_AUTO_INDEX_MIN_UNITS` | Minimum code-unit count before auto mode may select warm ROCm/MIGraphX indexing; default `2000` |
 | `NEXT_PLAID_MIGRAPHX_STATIC_CACHE_ROOT` | Override fixed-shape MIGraphX cache directory                |
 | `NEXT_PLAID_MIGRAPHX_WARM_MAX_SEQUENCE_LEN` | Max sequence length warmed by `warm-rocm-cache`          |
 | `NEXT_PLAID_MIGRAPHX_WARM_CACHE`        | `background` starts a separate cache-warming process during ROCm runs; `blocking` warms synchronously |
