@@ -1435,6 +1435,11 @@ impl ColbertBuilder {
         }
         if let Some(document_length) = self.document_length {
             config.document_length = document_length;
+        } else if self.execution_provider == ExecutionProvider::MIGraphX {
+            if let Some(document_length) = migraphx_env_usize("NEXT_PLAID_MIGRAPHX_DOCUMENT_LENGTH")
+            {
+                config.document_length = document_length.max(2);
+            }
         }
 
         update_token_ids(&mut config, &tokenizer);
