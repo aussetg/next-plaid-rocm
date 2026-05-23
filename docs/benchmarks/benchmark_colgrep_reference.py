@@ -60,16 +60,19 @@ DEFAULT_QUERIES: list[dict[str, Any]] = [
         "name": "error-handling",
         "query": "error handling and graceful failure paths",
         "args": [],
+        "top_k": 7,
     },
     {
         "name": "model-loading",
         "query": "load the embedding model and initialize onnx runtime",
         "args": [],
+        "top_k": 9,
     },
     {
         "name": "index-update",
         "query": "incremental index update when files change",
         "args": [],
+        "top_k": 5,
     },
     {
         "name": "regex-hybrid-rust",
@@ -80,6 +83,7 @@ DEFAULT_QUERIES: list[dict[str, Any]] = [
         "name": "json-output",
         "query": "serialize search results as json",
         "args": ["--include", "*.rs"],
+        "top_k": 7,
     },
 ]
 
