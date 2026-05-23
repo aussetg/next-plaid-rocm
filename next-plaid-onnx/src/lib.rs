@@ -57,9 +57,10 @@ use ort::value::Tensor;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::path::Path;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Once;
@@ -463,6 +464,14 @@ fn configure_execution_provider(
     builder: SessionBuilder,
     provider: ExecutionProvider,
 ) -> Result<SessionBuilder> {
+    configure_execution_provider_with_options(builder, provider, None)
+}
+
+fn configure_execution_provider_with_options(
+    builder: SessionBuilder,
+    provider: ExecutionProvider,
+    migraphx_model_cache_dir: Option<&Path>,
+) -> Result<SessionBuilder> {
     match provider {
         ExecutionProvider::Auto => configure_auto_provider(builder),
         ExecutionProvider::Cpu => Ok(builder),
@@ -470,7 +479,7 @@ fn configure_execution_provider(
         ExecutionProvider::TensorRT => configure_tensorrt(builder),
         ExecutionProvider::CoreML => configure_coreml(builder),
         ExecutionProvider::DirectML => configure_directml(builder),
-        ExecutionProvider::MIGraphX => configure_migraphx(builder),
+        ExecutionProvider::MIGraphX => configure_migraphx(builder, migraphx_model_cache_dir),
     }
 }
 
@@ -700,7 +709,7 @@ fn configure_auto_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
 
     #[cfg(feature = "migraphx")]
     if !force_cpu {
-        if let Ok(b) = configure_migraphx(builder.clone()) {
+        if let Ok(b) = configure_migraphx(builder.clone(), None) {
             return Ok(b);
         }
     }
@@ -785,19 +794,25 @@ fn configure_directml(_builder: SessionBuilder) -> Result<SessionBuilder> {
 }
 
 #[cfg(feature = "migraphx")]
-fn configure_migraphx(builder: SessionBuilder) -> Result<SessionBuilder> {
+fn configure_migraphx(
+    builder: SessionBuilder,
+    model_cache_dir: Option<&Path>,
+) -> Result<SessionBuilder> {
     if is_force_cpu() {
         return Ok(builder);
     }
     let mut builder = builder;
-    append_migraphx_execution_provider(&mut builder).context(
+    append_migraphx_execution_provider(&mut builder, model_cache_dir).context(
         "Failed to configure MIGraphX execution provider. Ensure ROCm and MIGraphX are installed.",
     )?;
     Ok(builder)
 }
 
 #[cfg(feature = "migraphx")]
-fn append_migraphx_execution_provider(builder: &mut SessionBuilder) -> ort::Result<()> {
+fn append_migraphx_execution_provider(
+    builder: &mut SessionBuilder,
+    model_cache_dir: Option<&Path>,
+) -> ort::Result<()> {
     use ort::AsPointer;
 
     // Use the provider-options map API instead of the legacy
@@ -812,7 +827,12 @@ fn append_migraphx_execution_provider(builder: &mut SessionBuilder) -> ort::Resu
     if env_flag_enabled("NEXT_PLAID_MIGRAPHX_FP16") {
         options.push(("migraphx_fp16_enable".to_string(), "1".to_string()));
     }
-    if let Ok(path) = std::env::var("NEXT_PLAID_MIGRAPHX_MODEL_CACHE_DIR") {
+    if let Some(path) = model_cache_dir {
+        options.push((
+            "migraphx_model_cache_dir".to_string(),
+            path.display().to_string(),
+        ));
+    } else if let Ok(path) = std::env::var("NEXT_PLAID_MIGRAPHX_MODEL_CACHE_DIR") {
         if !path.trim().is_empty() {
             options.push(("migraphx_model_cache_dir".to_string(), path));
         }
@@ -845,7 +865,10 @@ fn append_migraphx_execution_provider(builder: &mut SessionBuilder) -> ort::Resu
 }
 
 #[cfg(not(feature = "migraphx"))]
-fn configure_migraphx(_builder: SessionBuilder) -> Result<SessionBuilder> {
+fn configure_migraphx(
+    _builder: SessionBuilder,
+    _model_cache_dir: Option<&Path>,
+) -> Result<SessionBuilder> {
     anyhow::bail!("MIGraphX support not compiled. Enable the 'rocm' or 'migraphx' feature.")
 }
 
@@ -1007,6 +1030,19 @@ const DEFAULT_CPU_BATCH_SIZE: usize = 32;
 /// Default batch size for GPU encoding.
 const DEFAULT_GPU_BATCH_SIZE: usize = 64;
 
+/// Fixed ONNX input shape used for shape-specialized MIGraphX sessions.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MigraphxStaticShape {
+    pub batch_size: usize,
+    pub sequence_length: usize,
+}
+
+impl MigraphxStaticShape {
+    fn cache_dir_name(self) -> String {
+        format!("{}x{}", self.batch_size, self.sequence_length)
+    }
+}
+
 /// Type alias for batch encoding data: (input_ids, attention_mask, token_type_ids, token_ids)
 /// ColBERT model for encoding documents and queries into multi-vector embeddings.
 ///
@@ -1038,8 +1074,33 @@ pub struct Colbert {
     pub requested_execution_provider: ExecutionProvider,
     batch_size: usize,
     dynamic_batch: bool,
+    migraphx_hybrid: Option<Arc<MigraphxHybrid>>,
 }
 
+struct MigraphxHybrid {
+    model_dir: PathBuf,
+    quantized: bool,
+    tokenizer: Arc<Tokenizer>,
+    config: Arc<ColbertConfig>,
+    query_length: usize,
+    document_length: usize,
+    cpu_fallback_parallel: usize,
+    cpu_model: Mutex<Option<Colbert>>,
+    cache_root: PathBuf,
+    model_cache_key: String,
+    supported_shapes: HashSet<MigraphxStaticShape>,
+    shape_models: Mutex<HashMap<MigraphxStaticShape, Colbert>>,
+    warming_shapes: Mutex<HashSet<MigraphxStaticShape>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MigraphxWarmPolicy {
+    Off,
+    Background,
+    Blocking,
+}
+
+#[derive(Clone)]
 pub struct PreparedDocumentBatch {
     /// Number of real documents/chunks in this prepared batch.
     batch_size: usize,
@@ -1192,6 +1253,10 @@ pub struct ColbertBuilder {
     dynamic_batch: bool,
     query_length: Option<usize>,
     document_length: Option<usize>,
+    migraphx_static_shape: Option<MigraphxStaticShape>,
+    migraphx_model_cache_dir: Option<PathBuf>,
+    migraphx_cold_shape_cpu_fallback: Option<bool>,
+    migraphx_cpu_fallback_parallel: Option<usize>,
 }
 
 impl ColbertBuilder {
@@ -1215,6 +1280,10 @@ impl ColbertBuilder {
             dynamic_batch: true,
             query_length: None,
             document_length: None,
+            migraphx_static_shape: None,
+            migraphx_model_cache_dir: None,
+            migraphx_cold_shape_cpu_fallback: None,
+            migraphx_cpu_fallback_parallel: None,
         }
     }
 
@@ -1268,6 +1337,40 @@ impl ColbertBuilder {
         self
     }
 
+    /// Specialize a MIGraphX session to one fixed ONNX input shape.
+    ///
+    /// This is primarily used internally by the cold-shape CPU fallback/cache
+    /// path. It binds the model's symbolic `batch_size` and `sequence_length`
+    /// dimensions before creating the ONNX Runtime session.
+    pub fn with_migraphx_static_shape(mut self, batch_size: usize, sequence_length: usize) -> Self {
+        self.migraphx_static_shape = Some(MigraphxStaticShape {
+            batch_size: batch_size.max(1),
+            sequence_length: sequence_length.max(1),
+        });
+        self
+    }
+
+    /// Set the MIGraphX model-cache directory for this session.
+    ///
+    /// Shape-specialized callers should provide one directory per fixed input
+    /// shape to avoid cross-shape MXR cache reuse.
+    pub fn with_migraphx_model_cache_dir<P: AsRef<Path>>(mut self, cache_dir: P) -> Self {
+        self.migraphx_model_cache_dir = Some(cache_dir.as_ref().to_path_buf());
+        self
+    }
+
+    /// Enable or disable MIGraphX cold-shape CPU fallback.
+    pub fn with_migraphx_cold_shape_cpu_fallback(mut self, enabled: bool) -> Self {
+        self.migraphx_cold_shape_cpu_fallback = Some(enabled);
+        self
+    }
+
+    /// Set the number of CPU sessions used by MIGraphX cold-shape fallback.
+    pub fn with_migraphx_cpu_fallback_parallel(mut self, num_sessions: usize) -> Self {
+        self.migraphx_cpu_fallback_parallel = Some(num_sessions.max(1));
+        self
+    }
+
     /// Set the maximum query length.
     ///
     /// If not set, uses `query_length` from `onnx_config.json` (default: 48).
@@ -1289,8 +1392,15 @@ impl ColbertBuilder {
     /// Build the Colbert model.
     pub fn build(self) -> Result<Colbert> {
         let build_start = Instant::now();
+        let model_dir_path = self.model_dir.clone();
+        let quantized = self.quantized;
+        let requested_execution_provider = self.execution_provider;
+        let migraphx_static_shape = self.migraphx_static_shape;
+        let migraphx_model_cache_dir = self.migraphx_model_cache_dir.clone();
+        let migraphx_cold_shape_cpu_fallback = self.migraphx_cold_shape_cpu_fallback;
+        let migraphx_cpu_fallback_parallel = self.migraphx_cpu_fallback_parallel;
         onnx_diag!(
-            "build start model_dir={} provider={} quantized={} sessions={} threads_per_session={} batch_size={:?} dynamic_batch={} query_length={:?} document_length={:?}",
+            "build start model_dir={} provider={} quantized={} sessions={} threads_per_session={} batch_size={:?} dynamic_batch={} query_length={:?} document_length={:?} migraphx_static_shape={:?}",
             self.model_dir.display(),
             self.execution_provider.display_name(),
             self.quantized,
@@ -1299,7 +1409,8 @@ impl ColbertBuilder {
             self.batch_size,
             self.dynamic_batch,
             self.query_length,
-            self.document_length
+            self.document_length,
+            self.migraphx_static_shape
         );
 
         let init_start = Instant::now();
@@ -1363,6 +1474,19 @@ impl ColbertBuilder {
                 .map_err(|e| anyhow::anyhow!("Failed to set ONNX intra-op threads: {e:?}"))?
                 .with_inter_threads(if self.num_sessions > 1 { 1 } else { 2 })
                 .map_err(|e| anyhow::anyhow!("Failed to set ONNX inter-op threads: {e:?}"))?;
+            let builder = if let Some(shape) = migraphx_static_shape {
+                builder
+                    .with_dimension_override("batch_size", shape.batch_size as i64)
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to set MIGraphX static batch dimension: {e:?}")
+                    })?
+                    .with_dimension_override("sequence_length", shape.sequence_length as i64)
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to set MIGraphX static sequence dimension: {e:?}")
+                    })?
+            } else {
+                builder
+            };
             // Disable memory pattern optimization for all providers.
             // On CPU this helps with variable-length sequences (~7% speedup).
             // On GPU this prevents ORT from pre-allocating a large memory arena
@@ -1371,7 +1495,11 @@ impl ColbertBuilder {
                 .with_memory_pattern(false)
                 .map_err(|e| anyhow::anyhow!("Failed to configure ONNX memory pattern: {e:?}"))?;
 
-            let builder = configure_execution_provider(builder, self.execution_provider)?;
+            let builder = configure_execution_provider_with_options(
+                builder,
+                self.execution_provider,
+                migraphx_model_cache_dir.as_deref(),
+            )?;
 
             let commit_start = Instant::now();
             onnx_diag!(
@@ -1406,15 +1534,44 @@ impl ColbertBuilder {
             gpu_execution_requested
         );
 
+        let tokenizer = Arc::new(tokenizer);
+        let config = Arc::new(config);
+        let skiplist_ids = Arc::new(skiplist_ids);
+
+        let migraphx_hybrid = if should_enable_migraphx_cold_shape_cpu_fallback(
+            requested_execution_provider,
+            migraphx_static_shape,
+            migraphx_cold_shape_cpu_fallback,
+        ) {
+            let cache_root = default_migraphx_static_cache_root().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Failed to determine MIGraphX static-shape cache directory. Set NEXT_PLAID_MIGRAPHX_STATIC_CACHE_ROOT."
+                )
+            })?;
+            Some(Arc::new(MigraphxHybrid::new(
+                model_dir_path.clone(),
+                quantized,
+                &onnx_path,
+                Arc::clone(&tokenizer),
+                Arc::clone(&config),
+                batch_size,
+                cache_root,
+                migraphx_cpu_fallback_parallel,
+            )?))
+        } else {
+            None
+        };
+
         Ok(Colbert {
             sessions,
-            tokenizer: Arc::new(tokenizer),
-            config: Arc::new(config),
-            skiplist_ids: Arc::new(skiplist_ids),
+            tokenizer,
+            config,
+            skiplist_ids,
             next_session_idx: Arc::new(AtomicUsize::new(0)),
             requested_execution_provider: self.execution_provider,
             batch_size,
             dynamic_batch: self.dynamic_batch,
+            migraphx_hybrid,
         })
     }
 }
@@ -1481,6 +1638,11 @@ impl Colbert {
     pub fn encode_documents_raw(&self, documents: &[&str]) -> Result<Vec<Array2<f32>>> {
         if documents.is_empty() {
             return Ok(Vec::new());
+        }
+
+        if self.migraphx_hybrid.is_some() {
+            let prepared = self.tokenize_documents_in_batches(documents)?;
+            return self.encode_prepared_document_batches(prepared);
         }
 
         if self.sessions.len() == 1 {
@@ -1665,6 +1827,10 @@ impl Colbert {
             return Ok(Vec::new());
         }
 
+        if let Some(hybrid) = &self.migraphx_hybrid {
+            return hybrid.encode_prepared_document_batches(prepared_batches);
+        }
+
         let total_start = Instant::now();
         onnx_diag!(
             "encode_prepared_document_batches start {} sessions={}",
@@ -1688,45 +1854,7 @@ impl Colbert {
             }
         }
 
-        let encoded: Vec<Array2<f32>> = if self.sessions.len() <= 1 || prepared_batches.len() == 1 {
-            let mut all_embeddings = Vec::new();
-            for prepared_batch in prepared_batches {
-                all_embeddings.extend(self.encode_prepared_documents(prepared_batch)?);
-            }
-            all_embeddings
-        } else {
-            let results: Vec<Result<Vec<Array2<f32>>>> = std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(prepared_batches.len());
-
-                for (i, prepared_batch) in prepared_batches.into_iter().enumerate() {
-                    let session_idx = i % self.sessions.len();
-                    let session_mutex = &self.sessions[session_idx];
-                    let config = &self.config;
-                    let skiplist_ids = &self.skiplist_ids;
-
-                    handles.push(scope.spawn(move || {
-                        let mut session = session_mutex.lock().unwrap();
-                        encode_prepared_batch_with_session(
-                            &mut session,
-                            config,
-                            skiplist_ids,
-                            prepared_batch,
-                        )
-                    }));
-                }
-
-                handles
-                    .into_iter()
-                    .map(|handle| handle.join().unwrap())
-                    .collect()
-            });
-
-            let mut all_embeddings = Vec::new();
-            for result in results {
-                all_embeddings.extend(result?);
-            }
-            all_embeddings
-        };
+        let encoded = self.encode_prepared_batches_unordered(prepared_batches)?;
 
         onnx_diag!(
             "encode_prepared_document_batches encoded embeddings={} total_ms={:.3}",
@@ -1734,33 +1862,52 @@ impl Colbert {
             elapsed_ms(total_start)
         );
 
-        if !has_reordering || combined_indices.len() != encoded.len() {
-            return Ok(encoded);
+        restore_original_input_order(encoded, combined_indices, has_reordering)
+    }
+
+    fn encode_prepared_batches_unordered(
+        &self,
+        prepared_batches: Vec<PreparedDocumentBatch>,
+    ) -> Result<Vec<Array2<f32>>> {
+        if self.sessions.len() <= 1 || prepared_batches.len() == 1 {
+            let mut all_embeddings = Vec::new();
+            for prepared_batch in prepared_batches {
+                all_embeddings.extend(self.encode_prepared_documents(prepared_batch)?);
+            }
+            return Ok(all_embeddings);
         }
 
-        // Restore input order: encoded[i] belongs at output position combined_indices[i].
-        let n = encoded.len();
-        let mut reordered: Vec<Option<Array2<f32>>> = (0..n).map(|_| None).collect();
-        for (encoded_pos, embedding) in encoded.into_iter().enumerate() {
-            let target = combined_indices[encoded_pos];
-            if target >= n {
-                anyhow::bail!(
-                    "original_input_indices points to out-of-range slot ({} >= {})",
-                    target,
-                    n
-                );
+        let results: Vec<Result<Vec<Array2<f32>>>> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(prepared_batches.len());
+
+            for (i, prepared_batch) in prepared_batches.into_iter().enumerate() {
+                let session_idx = i % self.sessions.len();
+                let session_mutex = &self.sessions[session_idx];
+                let config = &self.config;
+                let skiplist_ids = &self.skiplist_ids;
+
+                handles.push(scope.spawn(move || {
+                    let mut session = session_mutex.lock().unwrap();
+                    encode_prepared_batch_with_session(
+                        &mut session,
+                        config,
+                        skiplist_ids,
+                        prepared_batch,
+                    )
+                }));
             }
-            reordered[target] = Some(embedding);
+
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        let mut all_embeddings = Vec::new();
+        for result in results {
+            all_embeddings.extend(result?);
         }
-        reordered
-            .into_iter()
-            .enumerate()
-            .map(|(i, opt)| {
-                opt.ok_or_else(|| {
-                    anyhow::anyhow!("original_input_indices missing slot {} in output", i)
-                })
-            })
-            .collect()
+        Ok(all_embeddings)
     }
 
     /// Stream document embeddings chunk-by-chunk.
@@ -1890,6 +2037,10 @@ impl Colbert {
             return Ok(Vec::new());
         }
 
+        if let Some(hybrid) = &self.migraphx_hybrid {
+            return hybrid.encode_queries(queries, self.batch_size);
+        }
+
         if self.sessions.len() == 1 {
             self.encode_single_session(queries, true, false)
         } else {
@@ -1915,6 +2066,32 @@ impl Colbert {
     /// Get the number of parallel sessions.
     pub fn num_sessions(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Warm and validate all fixed-shape MIGraphX caches for this model.
+    ///
+    /// This is only available when the model was built with
+    /// `ExecutionProvider::MIGraphX` and cold-shape CPU fallback enabled.
+    pub fn warm_migraphx_static_shape_cache(&self) -> Result<usize> {
+        self.migraphx_hybrid
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MIGraphX static-shape cache warming is only available for non-static MIGraphX models with cold-shape CPU fallback enabled"
+                )
+            })?
+            .warm_default_shapes()
+    }
+
+    /// Return the fixed MIGraphX shapes this model may use when their caches
+    /// are warm and validated.
+    pub fn migraphx_static_shapes(&self) -> Vec<MigraphxStaticShape> {
+        let Some(hybrid) = &self.migraphx_hybrid else {
+            return Vec::new();
+        };
+        let mut shapes: Vec<_> = hybrid.supported_shapes.iter().copied().collect();
+        shapes.sort_by_key(|shape| (shape.sequence_length, shape.batch_size));
+        shapes
     }
 
     // =========================================================================
@@ -2220,6 +2397,551 @@ fn build_fixed_dynamic_shapes(batch_size: usize, document_length: usize) -> Vec<
 
     shapes.sort_by_key(|shape| shape.planned_len);
     shapes
+}
+
+fn migraphx_cold_shape_cpu_fallback_default_enabled() -> bool {
+    std::env::var("NEXT_PLAID_MIGRAPHX_COLD_SHAPE_CPU_FALLBACK")
+        .map(|value| {
+            let value = value.trim();
+            !(value.is_empty()
+                || value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off"))
+        })
+        .unwrap_or(true)
+}
+
+fn should_enable_migraphx_cold_shape_cpu_fallback(
+    provider: ExecutionProvider,
+    static_shape: Option<MigraphxStaticShape>,
+    override_enabled: Option<bool>,
+) -> bool {
+    provider == ExecutionProvider::MIGraphX
+        && static_shape.is_none()
+        && override_enabled.unwrap_or_else(migraphx_cold_shape_cpu_fallback_default_enabled)
+}
+
+fn migraphx_warm_policy() -> MigraphxWarmPolicy {
+    match std::env::var("NEXT_PLAID_MIGRAPHX_WARM_CACHE") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" | "background" | "async" => MigraphxWarmPolicy::Background,
+            "blocking" | "sync" | "synchronous" => MigraphxWarmPolicy::Blocking,
+            _ => MigraphxWarmPolicy::Off,
+        },
+        Err(_) => MigraphxWarmPolicy::Off,
+    }
+}
+
+fn default_migraphx_background_warm_max_sequence_len() -> usize {
+    migraphx_env_usize("NEXT_PLAID_MIGRAPHX_BACKGROUND_WARM_MAX_SEQUENCE_LEN").unwrap_or(512)
+}
+
+fn default_migraphx_blocking_warm_max_sequence_len() -> usize {
+    migraphx_env_usize("NEXT_PLAID_MIGRAPHX_WARM_MAX_SEQUENCE_LEN").unwrap_or(512)
+}
+
+fn default_migraphx_cpu_fallback_sessions() -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(16)
+        .min(16)
+        .max(1)
+}
+
+fn default_migraphx_static_cache_root() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("NEXT_PLAID_MIGRAPHX_STATIC_CACHE_ROOT") {
+        if !path.trim().is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+
+    if let Ok(path) = std::env::var("XDG_CACHE_HOME") {
+        if !path.trim().is_empty() {
+            return Some(PathBuf::from(path).join("next-plaid").join("migraphx"));
+        }
+    }
+
+    std::env::var("HOME").ok().and_then(|home| {
+        if home.trim().is_empty() {
+            None
+        } else {
+            Some(
+                PathBuf::from(home)
+                    .join(".cache")
+                    .join("next-plaid")
+                    .join("migraphx"),
+            )
+        }
+    })
+}
+
+fn cache_key_for_onnx(path: &Path, quantized: bool) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    quantized.hash(&mut hasher);
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+        .hash(&mut hasher);
+
+    if let Ok(metadata) = fs::metadata(path) {
+        metadata.len().hash(&mut hasher);
+        if let Ok(modified) = metadata.modified() {
+            if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                duration.as_secs().hash(&mut hasher);
+                duration.subsec_nanos().hash(&mut hasher);
+            }
+        }
+    }
+
+    format!("{:016x}", hasher.finish())
+}
+
+fn shape_cache_has_mxr(cache_dir: &Path) -> bool {
+    fs::read_dir(cache_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "mxr"))
+}
+
+fn restore_original_input_order(
+    encoded: Vec<Array2<f32>>,
+    combined_indices: Vec<usize>,
+    has_reordering: bool,
+) -> Result<Vec<Array2<f32>>> {
+    if !has_reordering || combined_indices.len() != encoded.len() {
+        return Ok(encoded);
+    }
+
+    let n = encoded.len();
+    let mut reordered: Vec<Option<Array2<f32>>> = (0..n).map(|_| None).collect();
+    for (encoded_pos, embedding) in encoded.into_iter().enumerate() {
+        let target = combined_indices[encoded_pos];
+        if target >= n {
+            anyhow::bail!(
+                "original_input_indices points to out-of-range slot ({} >= {})",
+                target,
+                n
+            );
+        }
+        reordered[target] = Some(embedding);
+    }
+    reordered
+        .into_iter()
+        .enumerate()
+        .map(|(i, opt)| {
+            opt.ok_or_else(|| {
+                anyhow::anyhow!("original_input_indices missing slot {} in output", i)
+            })
+        })
+        .collect()
+}
+
+impl MigraphxHybrid {
+    fn new(
+        model_dir: PathBuf,
+        quantized: bool,
+        onnx_path: &Path,
+        tokenizer: Arc<Tokenizer>,
+        config: Arc<ColbertConfig>,
+        batch_size: usize,
+        cache_root: PathBuf,
+        cpu_fallback_parallel: Option<usize>,
+    ) -> Result<Self> {
+        let cpu_sessions =
+            cpu_fallback_parallel.unwrap_or_else(default_migraphx_cpu_fallback_sessions);
+
+        let mut supported_shapes: HashSet<MigraphxStaticShape> =
+            build_fixed_dynamic_shapes(batch_size.max(1), config.document_length)
+                .into_iter()
+                .map(|shape| MigraphxStaticShape {
+                    batch_size: shape.docs,
+                    sequence_length: shape.planned_len,
+                })
+                .collect();
+        supported_shapes.insert(MigraphxStaticShape {
+            batch_size: 1,
+            sequence_length: config.query_length,
+        });
+
+        let hybrid = Self {
+            model_dir,
+            quantized,
+            tokenizer,
+            config: Arc::clone(&config),
+            query_length: config.query_length,
+            document_length: config.document_length,
+            cpu_fallback_parallel: cpu_sessions,
+            cpu_model: Mutex::new(None),
+            cache_root,
+            model_cache_key: cache_key_for_onnx(onnx_path, quantized),
+            supported_shapes,
+            shape_models: Mutex::new(HashMap::new()),
+            warming_shapes: Mutex::new(HashSet::new()),
+        };
+
+        onnx_diag!(
+            "MIGraphX hybrid enabled cache_root={} supported_shapes={:?} cpu_sessions={}",
+            hybrid.cache_root.display(),
+            hybrid.supported_shapes,
+            cpu_sessions
+        );
+
+        Ok(hybrid)
+    }
+
+    fn cpu_model(&self) -> Result<Colbert> {
+        let mut guard = self.cpu_model.lock().unwrap();
+        if guard.is_none() {
+            let model = ColbertBuilder::new(&self.model_dir)
+                .with_quantized(self.quantized)
+                .with_parallel(self.cpu_fallback_parallel)
+                .with_batch_size(1)
+                .with_dynamic_batch(false)
+                .with_query_length(self.query_length)
+                .with_document_length(self.document_length)
+                .with_execution_provider(ExecutionProvider::Cpu)
+                .with_migraphx_cold_shape_cpu_fallback(false)
+                .build()
+                .context("Failed to build CPU fallback model for MIGraphX cold shapes")?;
+            *guard = Some(model);
+        }
+        Ok(guard
+            .as_ref()
+            .expect("CPU fallback model just initialized")
+            .clone())
+    }
+
+    fn shape_cache_dir(&self, shape: MigraphxStaticShape) -> PathBuf {
+        self.cache_root
+            .join(&self.model_cache_key)
+            .join(shape.cache_dir_name())
+    }
+
+    fn marker_path(&self, shape: MigraphxStaticShape) -> PathBuf {
+        self.shape_cache_dir(shape).join("validated-v1")
+    }
+
+    fn is_supported_shape(&self, shape: MigraphxStaticShape) -> bool {
+        self.supported_shapes.contains(&shape)
+    }
+
+    fn is_shape_cache_warm(&self, shape: MigraphxStaticShape) -> bool {
+        if !self.is_supported_shape(shape) {
+            return false;
+        }
+        let cache_dir = self.shape_cache_dir(shape);
+        self.marker_path(shape).exists() && shape_cache_has_mxr(&cache_dir)
+    }
+
+    fn invalidate_shape_cache(&self, shape: MigraphxStaticShape) {
+        let _ = fs::remove_file(self.marker_path(shape));
+        self.shape_models.lock().unwrap().remove(&shape);
+    }
+
+    fn build_shape_model(&self, shape: MigraphxStaticShape) -> Result<Colbert> {
+        let cache_dir = self.shape_cache_dir(shape);
+        fs::create_dir_all(&cache_dir).with_context(|| {
+            format!(
+                "Failed to create MIGraphX cache directory {}",
+                cache_dir.display()
+            )
+        })?;
+
+        ColbertBuilder::new(&self.model_dir)
+            .with_quantized(self.quantized)
+            .with_parallel(1)
+            .with_batch_size(shape.batch_size)
+            .with_dynamic_batch(false)
+            .with_query_length(self.query_length)
+            .with_document_length(self.document_length)
+            .with_execution_provider(ExecutionProvider::MIGraphX)
+            .with_migraphx_static_shape(shape.batch_size, shape.sequence_length)
+            .with_migraphx_model_cache_dir(cache_dir)
+            .with_migraphx_cold_shape_cpu_fallback(false)
+            .build()
+    }
+
+    fn shape_model_if_warm(&self, shape: MigraphxStaticShape) -> Result<Option<Colbert>> {
+        if !self.is_shape_cache_warm(shape) {
+            return Ok(None);
+        }
+
+        if let Some(model) = self.shape_models.lock().unwrap().get(&shape).cloned() {
+            return Ok(Some(model));
+        }
+
+        let model = self.build_shape_model(shape).with_context(|| {
+            format!(
+                "Failed to build warm MIGraphX static-shape model for {:?}",
+                shape
+            )
+        })?;
+        self.shape_models
+            .lock()
+            .unwrap()
+            .insert(shape, model.clone());
+        Ok(Some(model))
+    }
+
+    fn dummy_prepared_batch(&self, shape: MigraphxStaticShape) -> PreparedDocumentBatch {
+        let element_count = shape.batch_size * shape.sequence_length;
+        let token_id = self.config.mask_token_id;
+        PreparedDocumentBatch {
+            batch_size: shape.batch_size,
+            tensor_batch_size: shape.batch_size,
+            batch_max_len: shape.sequence_length,
+            all_input_ids: vec![token_id as i64; element_count],
+            all_attention_mask: vec![1; element_count],
+            all_token_type_ids: if self.config.uses_token_type_ids {
+                Some(vec![0; element_count])
+            } else {
+                None
+            },
+            all_token_ids: vec![vec![token_id; shape.sequence_length]; shape.batch_size],
+            original_lengths: vec![shape.sequence_length; shape.batch_size],
+            is_query: false,
+            filter_skiplist: false,
+            original_input_indices: Vec::new(),
+        }
+    }
+
+    fn warm_shape(&self, shape: MigraphxStaticShape) -> Result<()> {
+        if !self.is_supported_shape(shape) {
+            anyhow::bail!(
+                "MIGraphX static shape {:?} is not in the supported shape set",
+                shape
+            );
+        }
+        if self.is_shape_cache_warm(shape) {
+            return Ok(());
+        }
+
+        onnx_diag!("MIGraphX warming static shape {:?}", shape);
+        let model = self.build_shape_model(shape)?;
+        let prepared = self.dummy_prepared_batch(shape);
+        model
+            .encode_prepared_documents(prepared)
+            .with_context(|| format!("Failed to validate MIGraphX static shape {:?}", shape))?;
+        fs::write(
+            self.marker_path(shape),
+            format!(
+                "validated-v1\nshape={}x{}\n",
+                shape.batch_size, shape.sequence_length
+            ),
+        )
+        .context("Failed to write MIGraphX shape-cache validation marker")?;
+        self.shape_models.lock().unwrap().insert(shape, model);
+        onnx_diag!("MIGraphX warmed static shape {:?}", shape);
+        Ok(())
+    }
+
+    fn should_background_warm(&self, shape: MigraphxStaticShape) -> bool {
+        self.is_supported_shape(shape)
+            && shape.sequence_length <= default_migraphx_background_warm_max_sequence_len()
+    }
+
+    fn maybe_warm_shape(self: &Arc<Self>, shape: MigraphxStaticShape) -> Result<()> {
+        if !self.is_supported_shape(shape) {
+            return Ok(());
+        }
+
+        match migraphx_warm_policy() {
+            MigraphxWarmPolicy::Off => Ok(()),
+            MigraphxWarmPolicy::Blocking => self.warm_shape(shape),
+            MigraphxWarmPolicy::Background => {
+                if !self.should_background_warm(shape) {
+                    return Ok(());
+                }
+
+                {
+                    let mut warming = self.warming_shapes.lock().unwrap();
+                    if !warming.insert(shape) {
+                        return Ok(());
+                    }
+                }
+
+                let this = Arc::clone(self);
+                let _ = std::thread::Builder::new()
+                    .name(format!("migraphx-warm-{}", shape.cache_dir_name()))
+                    .spawn(move || {
+                        if let Err(err) = this.warm_shape(shape) {
+                            onnx_diag!("MIGraphX background warm failed for {:?}: {err:#}", shape);
+                        }
+                        this.warming_shapes.lock().unwrap().remove(&shape);
+                    });
+                Ok(())
+            }
+        }
+    }
+
+    fn encode_one_prepared(
+        self: &Arc<Self>,
+        prepared: PreparedDocumentBatch,
+    ) -> Result<Vec<Array2<f32>>> {
+        let shape = MigraphxStaticShape {
+            batch_size: prepared.tensor_batch_size,
+            sequence_length: prepared.batch_max_len,
+        };
+
+        if let Some(model) = self.shape_model_if_warm(shape)? {
+            let cpu_fallback = prepared.clone();
+            match model.encode_prepared_documents(prepared) {
+                Ok(embeddings) => {
+                    onnx_diag!("MIGraphX hybrid used warm shape {:?}", shape);
+                    return Ok(embeddings);
+                }
+                Err(err) => {
+                    self.invalidate_shape_cache(shape);
+                    onnx_diag!(
+                        "MIGraphX warm shape {:?} failed validation/run, falling back to CPU: {err:#}",
+                        shape
+                    );
+                    return self.cpu_model()?.encode_prepared_documents(cpu_fallback);
+                }
+            }
+        }
+
+        self.maybe_warm_shape(shape)?;
+        onnx_diag!("MIGraphX hybrid CPU fallback for cold shape {:?}", shape);
+        self.cpu_model()?.encode_prepared_documents(prepared)
+    }
+
+    fn encode_prepared_document_batches(
+        self: &Arc<Self>,
+        prepared_batches: Vec<PreparedDocumentBatch>,
+    ) -> Result<Vec<Array2<f32>>> {
+        let mut combined_indices: Vec<usize> =
+            Vec::with_capacity(prepared_batches.iter().map(|b| b.batch_size).sum());
+        let mut has_reordering = false;
+        for batch in &prepared_batches {
+            if !batch.original_input_indices.is_empty() {
+                combined_indices.extend_from_slice(&batch.original_input_indices);
+                has_reordering = true;
+            }
+        }
+
+        let mut encoded_segments: Vec<(usize, Vec<Array2<f32>>)> = Vec::new();
+        let mut cpu_batches: Vec<(usize, PreparedDocumentBatch)> = Vec::new();
+
+        for (batch_idx, prepared) in prepared_batches.into_iter().enumerate() {
+            let shape = MigraphxStaticShape {
+                batch_size: prepared.tensor_batch_size,
+                sequence_length: prepared.batch_max_len,
+            };
+
+            match self.shape_model_if_warm(shape) {
+                Ok(Some(model)) => {
+                    let cpu_fallback = prepared.clone();
+                    match model.encode_prepared_documents(prepared) {
+                        Ok(embeddings) => {
+                            onnx_diag!("MIGraphX hybrid used warm shape {:?}", shape);
+                            encoded_segments.push((batch_idx, embeddings));
+                        }
+                        Err(err) => {
+                            self.invalidate_shape_cache(shape);
+                            onnx_diag!(
+                                "MIGraphX warm shape {:?} failed validation/run, falling back to CPU: {err:#}",
+                                shape
+                            );
+                            cpu_batches.push((batch_idx, cpu_fallback));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    self.maybe_warm_shape(shape)?;
+                    onnx_diag!("MIGraphX hybrid CPU fallback for cold shape {:?}", shape);
+                    cpu_batches.push((batch_idx, prepared));
+                }
+                Err(err) => {
+                    self.invalidate_shape_cache(shape);
+                    onnx_diag!(
+                        "MIGraphX warm shape {:?} could not be loaded, falling back to CPU: {err:#}",
+                        shape
+                    );
+                    cpu_batches.push((batch_idx, prepared));
+                }
+            }
+        }
+
+        if !cpu_batches.is_empty() {
+            let counts: Vec<(usize, usize)> = cpu_batches
+                .iter()
+                .map(|(idx, batch)| (*idx, batch.batch_size))
+                .collect();
+            let batches = cpu_batches
+                .into_iter()
+                .map(|(_, batch)| batch)
+                .collect::<Vec<_>>();
+            let cpu_model = self.cpu_model()?;
+            let cpu_encoded = cpu_model.encode_prepared_batches_unordered(batches)?;
+            let mut iter = cpu_encoded.into_iter();
+            for (batch_idx, count) in counts {
+                let mut embeddings = Vec::with_capacity(count);
+                for _ in 0..count {
+                    embeddings.push(iter.next().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "CPU fallback returned fewer embeddings than expected for MIGraphX hybrid batch"
+                        )
+                    })?);
+                }
+                encoded_segments.push((batch_idx, embeddings));
+            }
+            if iter.next().is_some() {
+                anyhow::bail!(
+                    "CPU fallback returned more embeddings than expected for MIGraphX hybrid batches"
+                );
+            }
+        }
+
+        encoded_segments.sort_by_key(|(batch_idx, _)| *batch_idx);
+        let mut encoded = Vec::new();
+        for (_, embeddings) in encoded_segments {
+            encoded.extend(embeddings);
+        }
+        restore_original_input_order(encoded, combined_indices, has_reordering)
+    }
+
+    fn encode_queries(
+        self: &Arc<Self>,
+        queries: &[&str],
+        batch_size: usize,
+    ) -> Result<Vec<Array2<f32>>> {
+        let _ = batch_size;
+        let mut encoded = Vec::with_capacity(queries.len());
+        for query in queries {
+            let processed = preprocess_texts(&self.config, &[*query]);
+            let tokenized = tokenize_processed_texts_individually(&self.tokenizer, &processed)?;
+            let prepared = prepare_batch_from_tokenized_documents(
+                &self.tokenizer,
+                &self.config,
+                tokenized,
+                true,
+                false,
+                Vec::new(),
+                Some(FixedDynamicShape {
+                    docs: 1,
+                    planned_len: self.query_length,
+                }),
+            )?;
+            encoded.extend(self.encode_one_prepared(prepared)?);
+        }
+        Ok(encoded)
+    }
+
+    fn warm_default_shapes(&self) -> Result<usize> {
+        let max_sequence_len = default_migraphx_blocking_warm_max_sequence_len();
+        let mut shapes: Vec<_> = self.supported_shapes.iter().copied().collect();
+        shapes.retain(|shape| shape.sequence_length <= max_sequence_len);
+        shapes.sort_by_key(|shape| (shape.sequence_length, shape.batch_size));
+        let mut warmed = 0;
+        for shape in shapes {
+            self.warm_shape(shape)?;
+            warmed += 1;
+        }
+        Ok(warmed)
+    }
 }
 
 fn update_token_ids(config: &mut ColbertConfig, tokenizer: &Tokenizer) {

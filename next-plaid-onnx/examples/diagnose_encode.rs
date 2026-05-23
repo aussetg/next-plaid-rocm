@@ -23,6 +23,7 @@ struct Args {
     repeat_text: String,
     repetitions: usize,
     query: bool,
+    warm_migraphx_cache: bool,
 }
 
 impl Default for Args {
@@ -41,6 +42,7 @@ impl Default for Args {
                     .to_string(),
             repetitions: 1,
             query: false,
+            warm_migraphx_cache: false,
         }
     }
 }
@@ -90,11 +92,13 @@ fn parse_args() -> Result<Args> {
                     .parse()?;
             }
             "--query" => args.query = true,
+            "--warm-migraphx-cache" => args.warm_migraphx_cache = true,
             "--help" | "-h" => {
                 println!(
                     "Usage: diagnose_encode --model PATH [--provider cpu|rocm|migraphx|auto] \
                      [--batch-size N] [--parallel N] [--static-batch] [--quantized|--fp32] \
-                     [--input texts.json-or-lines] [--docs N] [--repeat-text TEXT] [--repetitions N] [--query]"
+                     [--input texts.json-or-lines] [--docs N] [--repeat-text TEXT] [--repetitions N] [--query] \
+                     [--warm-migraphx-cache]"
                 );
                 std::process::exit(0);
             }
@@ -170,6 +174,20 @@ fn main() -> Result<()> {
         model.config().query_length,
         model.embedding_dim()
     );
+
+    if args.warm_migraphx_cache {
+        eprintln!(
+            "diagnose_encode warming_migraphx_shapes={:?}",
+            model.migraphx_static_shapes()
+        );
+        let warm_start = Instant::now();
+        let warmed = model.warm_migraphx_static_shape_cache()?;
+        eprintln!(
+            "diagnose_encode warm_migraphx_cache_ms={:.3} warmed_shapes={}",
+            elapsed_ms(warm_start),
+            warmed
+        );
+    }
 
     for repetition in 0..args.repetitions {
         if args.query {
