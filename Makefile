@@ -1,4 +1,4 @@
-.PHONY: all build test lint fmt check clean example install-hooks compare-reference lint-python fmt-python evaluate-scifact evaluate-scifact-cached compare-scifact compare-scifact-cached benchmark-scifact-update benchmark-scifact-api benchmark-scifact-docker benchmark-scifact-docker-cuda benchmark-scifact-docker-keep benchmark-scifact-stress benchmark-fastplaid-compat benchmark-fastplaid-compat-keep benchmark-api-encoding benchmark-onnx-api benchmark-onnx-api-cuda benchmark-onnx-api-gte benchmark-onnx-api-gte-int8 benchmark-onnx-vs-pylate ci-api ci-onnx ci-cli test-api-integration test-api-rate-limit onnx-setup onnx-export onnx-export-all onnx-benchmark onnx-benchmark-rust onnx-compare onnx-lint onnx-fmt docker-build docker-build-cuda docker-up docker-up-cuda docker-down docker-logs kill-api bump-version
+.PHONY: all build test lint fmt check clean example install-hooks compare-reference lint-python fmt-python evaluate-scifact evaluate-scifact-cached compare-scifact compare-scifact-cached benchmark-colgrep-reference benchmark-scifact-update benchmark-scifact-api benchmark-scifact-docker benchmark-scifact-docker-cuda benchmark-scifact-docker-keep benchmark-scifact-stress benchmark-fastplaid-compat benchmark-fastplaid-compat-keep benchmark-api-encoding benchmark-onnx-api benchmark-onnx-api-cuda benchmark-onnx-api-gte benchmark-onnx-api-gte-int8 benchmark-onnx-vs-pylate ci-api ci-onnx ci-cli test-api-integration test-api-rate-limit onnx-setup onnx-export onnx-export-all onnx-benchmark onnx-benchmark-rust onnx-compare onnx-lint onnx-fmt docker-build docker-build-cuda docker-up docker-up-cuda docker-down docker-logs kill-api bump-version
 
 all: fmt lint test
 
@@ -174,6 +174,12 @@ benchmark-scifact-stress:
 # Creates a fast-plaid format index, loads it with next-plaid-api, and validates ndcg@10 ~ 0.74
 benchmark-fastplaid-compat:
 	cd docs/benchmarks && uv sync --python 3.12 --extra eval && uv run python benchmark_fastplaid_compat.py
+
+# Benchmark this workspace's colgrep against the locally installed reference (/usr/bin/colgrep)
+# Usage: make benchmark-colgrep-reference PROJECT=/path/to/project MODEL=lightonai/LateOn-Code-edge
+benchmark-colgrep-reference:
+	cargo build --release -p colgrep
+	cd docs/benchmarks && uv sync --extra dev && uv run python benchmark_colgrep_reference.py --project $(or $(PROJECT),../..) --model $(or $(MODEL),lightonai/LateOn-Code-edge)
 
 # =============================================================================
 # Docker targets

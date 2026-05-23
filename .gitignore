@@ -57,6 +57,7 @@ test_index/
 # Benchmark results
 /target/criterion/
 evaluation_datasets/
+/docs/benchmarks/colgrep_reference_benchmark*.json
 
 # Claude
 .claude/
