@@ -599,6 +599,9 @@ cargo install colgrep --features cuda
 # Linux with CUDA + TensorRT
 cargo install colgrep --features "cuda,tensorrt"
 
+# Linux with AMD ROCm / MIGraphX
+cargo install colgrep --features rocm
+
 # Windows with DirectML
 cargo install colgrep --features directml
 ```
@@ -620,7 +623,11 @@ cargo install --path colgrep --features "accelerate,coreml"  # or your preferred
 | `openblas`   | Linux         | OpenBLAS for vector operations         |
 | `cuda`       | Linux/Windows | NVIDIA CUDA for model inference        |
 | `tensorrt`   | Linux         | NVIDIA TensorRT for model inference    |
+| `rocm`       | Linux         | AMD ROCm via MIGraphX for model inference |
+| `migraphx`   | Linux         | Low-level alias for the ROCm/MIGraphX EP |
 | `directml`   | Windows       | DirectML for model inference           |
+
+`rocm` enables ONNX Runtime's MIGraphX Execution Provider. ONNX Runtime 1.23 no longer supports the older ROCm Execution Provider, so AMD GPU inference requires an ONNX Runtime build with MIGraphX support, typically selected with `ORT_DYLIB_PATH`.
 
 <details>
 <summary><b>OpenBLAS setup (Linux)</b></summary>

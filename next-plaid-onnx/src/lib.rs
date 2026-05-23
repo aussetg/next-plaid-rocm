@@ -42,6 +42,7 @@
 //! - `tensorrt` - NVIDIA TensorRT (optimized CUDA)
 //! - `coreml` - Apple Silicon (macOS)
 //! - `directml` - Windows GPUs (DirectX 12)
+//! - `rocm`/`migraphx` - AMD GPUs through ONNX Runtime's MIGraphX EP
 //!
 //! When GPU features are enabled, the library automatically uses GPU if available
 //! and falls back to CPU if not.
@@ -181,7 +182,7 @@ fn find_onnxruntime_library() -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExecutionProvider {
     /// Automatically detect and use the best available hardware.
-    /// Tries in order: CUDA > TensorRT > CoreML > DirectML > CPU
+    /// Tries in order: CUDA > TensorRT > CoreML > DirectML > MIGraphX > CPU
     #[default]
     Auto,
     /// CPU execution only
@@ -194,7 +195,7 @@ pub enum ExecutionProvider {
     CoreML,
     /// DirectML execution (Windows GPUs, requires `directml` feature)
     DirectML,
-    /// MIGraphX execution (AMD GPUs, requires `migraphx` feature)
+    /// MIGraphX execution (AMD GPUs, requires `rocm` or `migraphx` feature)
     MIGraphX,
 }
 
@@ -460,7 +461,7 @@ fn configure_migraphx(builder: SessionBuilder) -> Result<SessionBuilder> {
 
 #[cfg(not(feature = "migraphx"))]
 fn configure_migraphx(_builder: SessionBuilder) -> Result<SessionBuilder> {
-    anyhow::bail!("MIGraphX support not compiled. Enable the 'migraphx' feature.")
+    anyhow::bail!("MIGraphX support not compiled. Enable the 'rocm' or 'migraphx' feature.")
 }
 
 // =============================================================================

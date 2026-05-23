@@ -116,6 +116,8 @@ coreml = ["next-plaid-onnx/coreml"]
 tensorrt = ["next-plaid-onnx/tensorrt"]
 directml = ["next-plaid-onnx/directml"]
 migraphx = ["next-plaid-onnx/migraphx"]
+# User-facing alias for AMD GPU inference through ONNX Runtime's MIGraphX EP.
+rocm = ["migraphx"]
 # Vector search acceleration (BLAS backends)
 accelerate = ["next-plaid/accelerate"]
 openblas = ["next-plaid/openblas"]

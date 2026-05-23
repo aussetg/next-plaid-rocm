@@ -16,7 +16,7 @@
 
 ## Rust Crate
 
-High-performance ColBERT inference with ONNX Runtime. Supports CPU, CUDA, TensorRT, CoreML, and DirectML.
+High-performance ColBERT inference with ONNX Runtime. Supports CPU, CUDA, TensorRT, CoreML, DirectML, and AMD ROCm via MIGraphX.
 
 ### Quick Start
 
@@ -75,9 +75,14 @@ next-plaid-onnx = { version = "0.2", features = ["coreml"] }
 
 # Windows DirectML (DirectX 12)
 next-plaid-onnx = { version = "0.2", features = ["directml"] }
+
+# AMD ROCm through ONNX Runtime MIGraphX
+next-plaid-onnx = { version = "0.2", features = ["rocm"] }
 ```
 
-`ExecutionProvider::Auto` tries providers in order: CUDA → TensorRT → CoreML → DirectML → CPU. Set `NEXT_PLAID_FORCE_CPU=1` to bypass all GPU providers.
+`ExecutionProvider::Auto` tries providers in order: CUDA → TensorRT → CoreML → DirectML → MIGraphX → CPU. Set `NEXT_PLAID_FORCE_CPU=1` to bypass all GPU providers.
+
+The `rocm` feature is a user-facing alias for `migraphx`. ONNX Runtime 1.23 no longer ships the older ROCm Execution Provider, so AMD GPU inference uses the MIGraphX Execution Provider and requires an ONNX Runtime build that includes MIGraphX.
 
 ### Token Pooling
 
@@ -148,6 +153,7 @@ pub enum ExecutionProvider {
     TensorRT,  // NVIDIA TensorRT (requires `tensorrt` feature)
     CoreML,    // Apple Silicon (requires `coreml` feature)
     DirectML,  // Windows DirectX 12 (requires `directml` feature)
+    MIGraphX,  // AMD ROCm (requires `rocm` or `migraphx` feature)
 }
 ```
 
