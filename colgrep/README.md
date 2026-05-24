@@ -748,6 +748,11 @@ quickly once loaded, but process/session setup dominates normal CLI searches.
 Set `NEXT_PLAID_MIGRAPHX_QUERY_GPU=1` only for diagnostics or long-lived
 wrappers that can amortize that setup cost.
 
+For ROCm tuning, set `NEXT_PLAID_ONNX_DIAG=1` to print MIGraphX hybrid
+performance counters, including per-shape warm GPU hits, warm-tail padding
+hits, CPU fallbacks, cache-load failures, cache warming attempts, and average
+route latency.
+
 ---
 
 ## Environment Variables
@@ -759,6 +764,7 @@ wrappers that can amortize that setup cost.
 | `XDG_CONFIG_HOME`                       | Override config directory                                    |
 | `HF_TOKEN`                              | HuggingFace token for private models                         |
 | `HUGGING_FACE_HUB_TOKEN`                | Alternative HF token variable                                |
+| `NEXT_PLAID_ONNX_DIAG`                  | Print ONNX/MIGraphX diagnostics, including hybrid per-shape performance counters |
 | `NEXT_PLAID_MIGRAPHX_FP16`              | Enable MIGraphX FP16 compilation (`1`/`true`); recommended opt-in ROCm performance mode after validating quality |
 | `NEXT_PLAID_MIGRAPHX_DOCUMENT_LENGTH`   | Optional ROCm/MIGraphX max document-token cap, e.g. `512`    |
 | `NEXT_PLAID_MIGRAPHX_QUERY_GPU`         | Opt into MIGraphX query embedding for search; defaults to CPU for one-shot CLI latency |

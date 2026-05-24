@@ -124,6 +124,12 @@ Applications that want safe auto-selection can inspect
 lets cold or incomplete shape caches stay on CPU while fully warmed workloads
 use ROCm.
 
+When tuning hybrid ROCm routing, call
+`Colbert::migraphx_hybrid_performance_counters()` or set
+`NEXT_PLAID_ONNX_DIAG=1` to see per-shape counters for warm GPU hits,
+warm-tail row padding, CPU fallbacks, cache-load failures, cache warming, and
+average route latency.
+
 For warmed ROCm throughput, `NEXT_PLAID_MIGRAPHX_FP16=1` enables MIGraphX's
 `migraphx_fp16_enable` provider option:
 
@@ -180,6 +186,10 @@ impl Colbert {
     pub fn embedding_dim(&self) -> usize;
     pub fn batch_size(&self) -> usize;
     pub fn num_sessions(&self) -> usize;
+
+    pub fn migraphx_hybrid_performance_counters(
+        &self,
+    ) -> Option<MigraphxHybridPerformanceCounters>;
 }
 ```
 

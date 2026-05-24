@@ -1045,6 +1045,128 @@ impl MigraphxStaticShape {
     }
 }
 
+/// Snapshot of MIGraphX hybrid routing/performance counters.
+///
+/// The hybrid ROCm path routes each prepared batch to either a warm static
+/// MIGraphX shape, a warm row-padded tail shape, or CPU fallback. These
+/// counters make that routing visible for diagnostics and benchmark tuning.
+#[derive(Clone, Debug, Default)]
+pub struct MigraphxHybridPerformanceCounters {
+    pub warm_gpu_hits: u64,
+    pub warm_gpu_documents: u64,
+    pub warm_gpu_total_ns: u128,
+    pub warm_gpu_avg_ns: u128,
+    pub warm_tail_gpu_hits: u64,
+    pub warm_tail_gpu_documents: u64,
+    pub warm_tail_gpu_total_ns: u128,
+    pub warm_tail_gpu_avg_ns: u128,
+    pub cpu_fallbacks: u64,
+    pub cpu_fallback_documents: u64,
+    pub cpu_fallback_total_ns: u128,
+    pub cpu_fallback_avg_ns: u128,
+    pub cache_loads: u64,
+    pub cache_load_failures: u64,
+    pub cache_load_total_ns: u128,
+    pub cache_load_avg_ns: u128,
+    pub warm_attempts: u64,
+    pub warm_successes: u64,
+    pub warm_failures: u64,
+    pub warm_total_ns: u128,
+    pub warm_avg_ns: u128,
+    pub background_warm_requests: u64,
+    pub background_warmer_process_spawns: u64,
+    pub background_warmer_process_failures: u64,
+    pub per_shape: Vec<MigraphxHybridShapePerformanceCounters>,
+}
+
+impl MigraphxHybridPerformanceCounters {
+    /// Return a compact human-readable summary suitable for diagnostic logs.
+    pub fn summary_line(&self) -> String {
+        let gpu_hits = self.warm_gpu_hits + self.warm_tail_gpu_hits;
+        let gpu_documents = self.warm_gpu_documents + self.warm_tail_gpu_documents;
+        let gpu_total_ns = self.warm_gpu_total_ns + self.warm_tail_gpu_total_ns;
+        let gpu_avg_ns = avg_ns(gpu_total_ns, gpu_hits);
+        format!(
+            "gpu_hits={} gpu_docs={} gpu_avg_ms={:.3} tail_hits={} cpu_fallbacks={} cpu_docs={} cpu_avg_ms={:.3} cache_loads={} cache_load_failures={} warm_attempts={} warm_successes={} warm_failures={} background_requests={} background_spawns={} background_spawn_failures={}",
+            gpu_hits,
+            gpu_documents,
+            ns_to_ms(gpu_avg_ns),
+            self.warm_tail_gpu_hits,
+            self.cpu_fallbacks,
+            self.cpu_fallback_documents,
+            ns_to_ms(self.cpu_fallback_avg_ns),
+            self.cache_loads,
+            self.cache_load_failures,
+            self.warm_attempts,
+            self.warm_successes,
+            self.warm_failures,
+            self.background_warm_requests,
+            self.background_warmer_process_spawns,
+            self.background_warmer_process_failures,
+        )
+    }
+}
+
+/// Per-static-shape MIGraphX hybrid routing/performance counters.
+#[derive(Clone, Debug)]
+pub struct MigraphxHybridShapePerformanceCounters {
+    pub shape: MigraphxStaticShape,
+    pub warm_gpu_hits: u64,
+    pub warm_gpu_documents: u64,
+    pub warm_gpu_total_ns: u128,
+    pub warm_gpu_avg_ns: u128,
+    pub warm_tail_gpu_hits: u64,
+    pub warm_tail_gpu_documents: u64,
+    pub warm_tail_gpu_total_ns: u128,
+    pub warm_tail_gpu_avg_ns: u128,
+    pub cpu_fallbacks: u64,
+    pub cpu_fallback_documents: u64,
+    pub cpu_fallback_total_ns: u128,
+    pub cpu_fallback_avg_ns: u128,
+    pub cache_loads: u64,
+    pub cache_load_failures: u64,
+    pub cache_load_total_ns: u128,
+    pub cache_load_avg_ns: u128,
+    pub warm_attempts: u64,
+    pub warm_successes: u64,
+    pub warm_failures: u64,
+    pub warm_total_ns: u128,
+    pub warm_avg_ns: u128,
+    pub background_warm_requests: u64,
+    pub background_warmer_process_spawns: u64,
+    pub background_warmer_process_failures: u64,
+}
+
+impl MigraphxHybridShapePerformanceCounters {
+    /// Return a compact human-readable per-shape summary for diagnostics.
+    pub fn summary_line(&self) -> String {
+        let gpu_hits = self.warm_gpu_hits + self.warm_tail_gpu_hits;
+        let gpu_documents = self.warm_gpu_documents + self.warm_tail_gpu_documents;
+        let gpu_total_ns = self.warm_gpu_total_ns + self.warm_tail_gpu_total_ns;
+        let gpu_avg_ns = avg_ns(gpu_total_ns, gpu_hits);
+        format!(
+            "shape={}x{} gpu_hits={} gpu_docs={} gpu_avg_ms={:.3} tail_hits={} cpu_fallbacks={} cpu_docs={} cpu_avg_ms={:.3} cache_loads={} cache_load_failures={} warm_attempts={} warm_successes={} warm_failures={} background_requests={} background_shape_spawns={} background_shape_spawn_failures={}",
+            self.shape.batch_size,
+            self.shape.sequence_length,
+            gpu_hits,
+            gpu_documents,
+            ns_to_ms(gpu_avg_ns),
+            self.warm_tail_gpu_hits,
+            self.cpu_fallbacks,
+            self.cpu_fallback_documents,
+            ns_to_ms(self.cpu_fallback_avg_ns),
+            self.cache_loads,
+            self.cache_load_failures,
+            self.warm_attempts,
+            self.warm_successes,
+            self.warm_failures,
+            self.background_warm_requests,
+            self.background_warmer_process_spawns,
+            self.background_warmer_process_failures,
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MigraphxStaticShapeCacheStatus {
     pub cache_root: PathBuf,
@@ -1110,6 +1232,277 @@ struct MigraphxHybrid {
     supported_shapes: HashSet<MigraphxStaticShape>,
     shape_models: Mutex<HashMap<MigraphxStaticShape, Colbert>>,
     background_warmer_started: Mutex<bool>,
+    performance: Mutex<MigraphxHybridPerformanceStats>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MigraphxHybridShapePerformanceStats {
+    warm_gpu_hits: u64,
+    warm_gpu_documents: u64,
+    warm_gpu_total_ns: u128,
+    warm_tail_gpu_hits: u64,
+    warm_tail_gpu_documents: u64,
+    warm_tail_gpu_total_ns: u128,
+    cpu_fallbacks: u64,
+    cpu_fallback_documents: u64,
+    cpu_fallback_total_ns: u128,
+    cache_loads: u64,
+    cache_load_failures: u64,
+    cache_load_total_ns: u128,
+    warm_attempts: u64,
+    warm_successes: u64,
+    warm_failures: u64,
+    warm_total_ns: u128,
+    background_warm_requests: u64,
+    background_warmer_process_spawns: u64,
+    background_warmer_process_failures: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MigraphxHybridPerformanceStats {
+    by_shape: HashMap<MigraphxStaticShape, MigraphxHybridShapePerformanceStats>,
+    background_warmer_process_spawns: u64,
+    background_warmer_process_failures: u64,
+}
+
+fn avg_ns(total_ns: u128, count: u64) -> u128 {
+    if count == 0 {
+        0
+    } else {
+        total_ns / u128::from(count)
+    }
+}
+
+fn ns_to_ms(ns: u128) -> f64 {
+    ns as f64 / 1_000_000.0
+}
+
+fn elapsed_ns(start: Instant) -> u128 {
+    start.elapsed().as_nanos()
+}
+
+fn apportion_ns(total_ns: u128, weight: u128, total_weight: u128) -> u128 {
+    if total_weight == 0 {
+        total_ns
+    } else {
+        total_ns.saturating_mul(weight) / total_weight
+    }
+}
+
+impl MigraphxHybridShapePerformanceStats {
+    fn record_warm_gpu_hit(&mut self, documents: usize, elapsed_ns: u128) {
+        self.warm_gpu_hits = self.warm_gpu_hits.saturating_add(1);
+        self.warm_gpu_documents = self.warm_gpu_documents.saturating_add(documents as u64);
+        self.warm_gpu_total_ns = self.warm_gpu_total_ns.saturating_add(elapsed_ns);
+    }
+
+    fn record_warm_tail_gpu_hit(&mut self, documents: usize, elapsed_ns: u128) {
+        self.warm_tail_gpu_hits = self.warm_tail_gpu_hits.saturating_add(1);
+        self.warm_tail_gpu_documents = self
+            .warm_tail_gpu_documents
+            .saturating_add(documents as u64);
+        self.warm_tail_gpu_total_ns = self.warm_tail_gpu_total_ns.saturating_add(elapsed_ns);
+    }
+
+    fn record_cpu_fallback(&mut self, documents: usize, elapsed_ns: u128) {
+        self.cpu_fallbacks = self.cpu_fallbacks.saturating_add(1);
+        self.cpu_fallback_documents = self.cpu_fallback_documents.saturating_add(documents as u64);
+        self.cpu_fallback_total_ns = self.cpu_fallback_total_ns.saturating_add(elapsed_ns);
+    }
+
+    fn record_cache_load(&mut self, elapsed_ns: u128, failed: bool) {
+        self.cache_loads = self.cache_loads.saturating_add(1);
+        if failed {
+            self.cache_load_failures = self.cache_load_failures.saturating_add(1);
+        }
+        self.cache_load_total_ns = self.cache_load_total_ns.saturating_add(elapsed_ns);
+    }
+
+    fn record_warm_attempt(&mut self, elapsed_ns: u128, success: bool) {
+        self.warm_attempts = self.warm_attempts.saturating_add(1);
+        if success {
+            self.warm_successes = self.warm_successes.saturating_add(1);
+        } else {
+            self.warm_failures = self.warm_failures.saturating_add(1);
+        }
+        self.warm_total_ns = self.warm_total_ns.saturating_add(elapsed_ns);
+    }
+
+    fn record_background_warm_request(&mut self) {
+        self.background_warm_requests = self.background_warm_requests.saturating_add(1);
+    }
+
+    fn record_background_warmer_process_spawn(&mut self) {
+        self.background_warmer_process_spawns =
+            self.background_warmer_process_spawns.saturating_add(1);
+    }
+
+    fn record_background_warmer_process_failure(&mut self) {
+        self.background_warmer_process_failures =
+            self.background_warmer_process_failures.saturating_add(1);
+    }
+
+    fn snapshot(&self, shape: MigraphxStaticShape) -> MigraphxHybridShapePerformanceCounters {
+        MigraphxHybridShapePerformanceCounters {
+            shape,
+            warm_gpu_hits: self.warm_gpu_hits,
+            warm_gpu_documents: self.warm_gpu_documents,
+            warm_gpu_total_ns: self.warm_gpu_total_ns,
+            warm_gpu_avg_ns: avg_ns(self.warm_gpu_total_ns, self.warm_gpu_hits),
+            warm_tail_gpu_hits: self.warm_tail_gpu_hits,
+            warm_tail_gpu_documents: self.warm_tail_gpu_documents,
+            warm_tail_gpu_total_ns: self.warm_tail_gpu_total_ns,
+            warm_tail_gpu_avg_ns: avg_ns(self.warm_tail_gpu_total_ns, self.warm_tail_gpu_hits),
+            cpu_fallbacks: self.cpu_fallbacks,
+            cpu_fallback_documents: self.cpu_fallback_documents,
+            cpu_fallback_total_ns: self.cpu_fallback_total_ns,
+            cpu_fallback_avg_ns: avg_ns(self.cpu_fallback_total_ns, self.cpu_fallbacks),
+            cache_loads: self.cache_loads,
+            cache_load_failures: self.cache_load_failures,
+            cache_load_total_ns: self.cache_load_total_ns,
+            cache_load_avg_ns: avg_ns(self.cache_load_total_ns, self.cache_loads),
+            warm_attempts: self.warm_attempts,
+            warm_successes: self.warm_successes,
+            warm_failures: self.warm_failures,
+            warm_total_ns: self.warm_total_ns,
+            warm_avg_ns: avg_ns(self.warm_total_ns, self.warm_attempts),
+            background_warm_requests: self.background_warm_requests,
+            background_warmer_process_spawns: self.background_warmer_process_spawns,
+            background_warmer_process_failures: self.background_warmer_process_failures,
+        }
+    }
+}
+
+impl MigraphxHybridPerformanceStats {
+    fn shape_mut(
+        &mut self,
+        shape: MigraphxStaticShape,
+    ) -> &mut MigraphxHybridShapePerformanceStats {
+        self.by_shape.entry(shape).or_default()
+    }
+
+    fn record_warm_gpu_hit(
+        &mut self,
+        shape: MigraphxStaticShape,
+        documents: usize,
+        elapsed_ns: u128,
+    ) {
+        self.shape_mut(shape)
+            .record_warm_gpu_hit(documents, elapsed_ns);
+    }
+
+    fn record_warm_tail_gpu_hit(
+        &mut self,
+        shape: MigraphxStaticShape,
+        documents: usize,
+        elapsed_ns: u128,
+    ) {
+        self.shape_mut(shape)
+            .record_warm_tail_gpu_hit(documents, elapsed_ns);
+    }
+
+    fn record_cpu_fallback(
+        &mut self,
+        shape: MigraphxStaticShape,
+        documents: usize,
+        elapsed_ns: u128,
+    ) {
+        self.shape_mut(shape)
+            .record_cpu_fallback(documents, elapsed_ns);
+    }
+
+    fn record_cache_load(&mut self, shape: MigraphxStaticShape, elapsed_ns: u128, failed: bool) {
+        self.shape_mut(shape).record_cache_load(elapsed_ns, failed);
+    }
+
+    fn record_warm_attempt(&mut self, shape: MigraphxStaticShape, elapsed_ns: u128, success: bool) {
+        self.shape_mut(shape)
+            .record_warm_attempt(elapsed_ns, success);
+    }
+
+    fn record_background_warm_request(&mut self, shape: MigraphxStaticShape) {
+        self.shape_mut(shape).record_background_warm_request();
+    }
+
+    fn record_background_warmer_process_spawn(&mut self, shapes: &[MigraphxStaticShape]) {
+        self.background_warmer_process_spawns =
+            self.background_warmer_process_spawns.saturating_add(1);
+        for &shape in shapes {
+            self.shape_mut(shape)
+                .record_background_warmer_process_spawn();
+        }
+    }
+
+    fn record_background_warmer_process_failure(&mut self, shapes: &[MigraphxStaticShape]) {
+        self.background_warmer_process_failures =
+            self.background_warmer_process_failures.saturating_add(1);
+        for &shape in shapes {
+            self.shape_mut(shape)
+                .record_background_warmer_process_failure();
+        }
+    }
+
+    fn snapshot(&self) -> MigraphxHybridPerformanceCounters {
+        let mut per_shape: Vec<_> = self
+            .by_shape
+            .iter()
+            .map(|(&shape, stats)| stats.snapshot(shape))
+            .collect();
+        per_shape.sort_by_key(|stats| (stats.shape.sequence_length, stats.shape.batch_size));
+
+        let mut total = MigraphxHybridPerformanceCounters {
+            per_shape,
+            ..Default::default()
+        };
+        for stats in &total.per_shape {
+            total.warm_gpu_hits = total.warm_gpu_hits.saturating_add(stats.warm_gpu_hits);
+            total.warm_gpu_documents = total
+                .warm_gpu_documents
+                .saturating_add(stats.warm_gpu_documents);
+            total.warm_gpu_total_ns = total
+                .warm_gpu_total_ns
+                .saturating_add(stats.warm_gpu_total_ns);
+            total.warm_tail_gpu_hits = total
+                .warm_tail_gpu_hits
+                .saturating_add(stats.warm_tail_gpu_hits);
+            total.warm_tail_gpu_documents = total
+                .warm_tail_gpu_documents
+                .saturating_add(stats.warm_tail_gpu_documents);
+            total.warm_tail_gpu_total_ns = total
+                .warm_tail_gpu_total_ns
+                .saturating_add(stats.warm_tail_gpu_total_ns);
+            total.cpu_fallbacks = total.cpu_fallbacks.saturating_add(stats.cpu_fallbacks);
+            total.cpu_fallback_documents = total
+                .cpu_fallback_documents
+                .saturating_add(stats.cpu_fallback_documents);
+            total.cpu_fallback_total_ns = total
+                .cpu_fallback_total_ns
+                .saturating_add(stats.cpu_fallback_total_ns);
+            total.cache_loads = total.cache_loads.saturating_add(stats.cache_loads);
+            total.cache_load_failures = total
+                .cache_load_failures
+                .saturating_add(stats.cache_load_failures);
+            total.cache_load_total_ns = total
+                .cache_load_total_ns
+                .saturating_add(stats.cache_load_total_ns);
+            total.warm_attempts = total.warm_attempts.saturating_add(stats.warm_attempts);
+            total.warm_successes = total.warm_successes.saturating_add(stats.warm_successes);
+            total.warm_failures = total.warm_failures.saturating_add(stats.warm_failures);
+            total.warm_total_ns = total.warm_total_ns.saturating_add(stats.warm_total_ns);
+            total.background_warm_requests = total
+                .background_warm_requests
+                .saturating_add(stats.background_warm_requests);
+        }
+
+        total.background_warmer_process_spawns = self.background_warmer_process_spawns;
+        total.background_warmer_process_failures = self.background_warmer_process_failures;
+        total.warm_gpu_avg_ns = avg_ns(total.warm_gpu_total_ns, total.warm_gpu_hits);
+        total.warm_tail_gpu_avg_ns = avg_ns(total.warm_tail_gpu_total_ns, total.warm_tail_gpu_hits);
+        total.cpu_fallback_avg_ns = avg_ns(total.cpu_fallback_total_ns, total.cpu_fallbacks);
+        total.cache_load_avg_ns = avg_ns(total.cache_load_total_ns, total.cache_loads);
+        total.warm_avg_ns = avg_ns(total.warm_total_ns, total.warm_attempts);
+        total
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2173,6 +2566,16 @@ impl Colbert {
         let mut shapes: Vec<_> = hybrid.supported_shapes.iter().copied().collect();
         shapes.sort_by_key(|shape| (shape.sequence_length, shape.batch_size));
         shapes
+    }
+
+    /// Return MIGraphX hybrid routing/performance counters, when this model is
+    /// using the hybrid static-shape ROCm path.
+    pub fn migraphx_hybrid_performance_counters(
+        &self,
+    ) -> Option<MigraphxHybridPerformanceCounters> {
+        self.migraphx_hybrid
+            .as_ref()
+            .map(|hybrid| hybrid.performance_snapshot())
     }
 
     // =========================================================================
@@ -3664,6 +4067,7 @@ impl MigraphxHybrid {
             supported_shapes,
             shape_models: Mutex::new(HashMap::new()),
             background_warmer_started: Mutex::new(false),
+            performance: Mutex::new(MigraphxHybridPerformanceStats::default()),
         };
 
         onnx_diag!(
@@ -3681,6 +4085,59 @@ impl MigraphxHybrid {
         }
 
         Ok(hybrid)
+    }
+
+    fn performance_snapshot(&self) -> MigraphxHybridPerformanceCounters {
+        self.performance.lock().unwrap().snapshot()
+    }
+
+    fn log_performance_snapshot(&self) {
+        let snapshot = self.performance_snapshot();
+        onnx_diag!("MIGraphX hybrid counters {}", snapshot.summary_line());
+        for shape in &snapshot.per_shape {
+            onnx_diag!("MIGraphX hybrid counters {}", shape.summary_line());
+        }
+    }
+
+    fn record_warm_gpu_hit(&self, shape: MigraphxStaticShape, documents: usize, elapsed_ns: u128) {
+        self.performance
+            .lock()
+            .unwrap()
+            .record_warm_gpu_hit(shape, documents, elapsed_ns);
+    }
+
+    fn record_warm_tail_gpu_hit(
+        &self,
+        shape: MigraphxStaticShape,
+        documents: usize,
+        elapsed_ns: u128,
+    ) {
+        self.performance
+            .lock()
+            .unwrap()
+            .record_warm_tail_gpu_hit(shape, documents, elapsed_ns);
+    }
+
+    fn record_cpu_fallback(&self, shape: MigraphxStaticShape, documents: usize, elapsed_ns: u128) {
+        self.performance
+            .lock()
+            .unwrap()
+            .record_cpu_fallback(shape, documents, elapsed_ns);
+    }
+
+    fn encode_cpu_fallback_prepared(
+        &self,
+        shape: MigraphxStaticShape,
+        prepared: PreparedDocumentBatch,
+    ) -> Result<Vec<Array2<f32>>> {
+        let prepared = trim_prepared_batch_for_cpu_fallback(prepared)?;
+        let documents = prepared.batch_size;
+        let start = Instant::now();
+        let result = self.cpu_model()?.encode_prepared_documents(prepared);
+        if result.is_ok() {
+            self.record_cpu_fallback(shape, documents, elapsed_ns(start));
+        }
+        result
     }
 
     fn cpu_model(&self) -> Result<Colbert> {
@@ -3799,12 +4256,30 @@ impl MigraphxHybrid {
             return Ok(Some(model));
         }
 
-        let model = self.build_shape_model(shape).with_context(|| {
-            format!(
-                "Failed to build warm MIGraphX static-shape model for {:?}",
-                shape
-            )
-        })?;
+        let load_start = Instant::now();
+        let model = match self.build_shape_model(shape) {
+            Ok(model) => {
+                self.performance.lock().unwrap().record_cache_load(
+                    shape,
+                    elapsed_ns(load_start),
+                    false,
+                );
+                model
+            }
+            Err(err) => {
+                self.performance.lock().unwrap().record_cache_load(
+                    shape,
+                    elapsed_ns(load_start),
+                    true,
+                );
+                return Err(err).with_context(|| {
+                    format!(
+                        "Failed to build warm MIGraphX static-shape model for {:?}",
+                        shape
+                    )
+                });
+            }
+        };
         self.shape_models
             .lock()
             .unwrap()
@@ -3828,13 +4303,23 @@ impl MigraphxHybrid {
         }
 
         onnx_diag!("MIGraphX warming static shape {:?}", shape);
-        let model = self.build_shape_model(shape)?;
-        let prepared = self.dummy_prepared_batch(shape);
-        model
-            .encode_prepared_documents(prepared)
-            .with_context(|| format!("Failed to validate MIGraphX static shape {:?}", shape))?;
-        write_migraphx_validation_marker(&self.marker_path(shape), shape)?;
-        self.shape_models.lock().unwrap().insert(shape, model);
+        let warm_start = Instant::now();
+        let result = (|| -> Result<()> {
+            let model = self.build_shape_model(shape)?;
+            let prepared = self.dummy_prepared_batch(shape);
+            model
+                .encode_prepared_documents(prepared)
+                .with_context(|| format!("Failed to validate MIGraphX static shape {:?}", shape))?;
+            write_migraphx_validation_marker(&self.marker_path(shape), shape)?;
+            self.shape_models.lock().unwrap().insert(shape, model);
+            Ok(())
+        })();
+        let elapsed = elapsed_ns(warm_start);
+        self.performance
+            .lock()
+            .unwrap()
+            .record_warm_attempt(shape, elapsed, result.is_ok());
+        result?;
         onnx_diag!("MIGraphX warmed static shape {:?}", shape);
         Ok(())
     }
@@ -3878,7 +4363,7 @@ impl MigraphxHybrid {
             shapes_env
         );
 
-        Command::new(exe)
+        let spawn_result = Command::new(exe)
             .env(MIGRAPHX_WARMER_CHILD_ENV, "1")
             .env(MIGRAPHX_WARMER_MODEL_DIR_ENV, &self.model_dir)
             .env(
@@ -3900,15 +4385,35 @@ impl MigraphxHybrid {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
-            .context("Failed to spawn MIGraphX background warmer process")?;
-        Ok(())
+            .spawn();
+
+        match spawn_result {
+            Ok(_child) => {
+                self.performance
+                    .lock()
+                    .unwrap()
+                    .record_background_warmer_process_spawn(&shapes);
+                Ok(())
+            }
+            Err(err) => {
+                self.performance
+                    .lock()
+                    .unwrap()
+                    .record_background_warmer_process_failure(&shapes);
+                Err(err).context("Failed to spawn MIGraphX background warmer process")
+            }
+        }
     }
 
     fn maybe_spawn_background_warmer_process(&self, trigger_shape: MigraphxStaticShape) {
         if !self.should_background_warm(trigger_shape) {
             return;
         }
+
+        self.performance
+            .lock()
+            .unwrap()
+            .record_background_warm_request(trigger_shape);
 
         {
             let mut started = self.background_warmer_started.lock().unwrap();
@@ -3947,52 +4452,75 @@ impl MigraphxHybrid {
             sequence_length: prepared.batch_max_len,
         };
 
-        if let Some(model) = self.shape_model_if_warm(shape)? {
-            let cpu_fallback = prepared.clone();
-            match model.encode_prepared_documents(prepared) {
-                Ok(embeddings) => {
-                    onnx_diag!("MIGraphX hybrid used warm shape {:?}", shape);
-                    return Ok(embeddings);
+        match self.shape_model_if_warm(shape) {
+            Ok(Some(model)) => {
+                let cpu_fallback = prepared.clone();
+                let documents = prepared.batch_size;
+                let run_start = Instant::now();
+                match model.encode_prepared_documents(prepared) {
+                    Ok(embeddings) => {
+                        self.record_warm_gpu_hit(shape, documents, elapsed_ns(run_start));
+                        onnx_diag!("MIGraphX hybrid used warm shape {:?}", shape);
+                        return Ok(embeddings);
+                    }
+                    Err(err) => {
+                        self.invalidate_shape_cache(shape);
+                        onnx_diag!(
+                            "MIGraphX warm shape {:?} failed validation/run, falling back to CPU: {err:#}",
+                            shape
+                        );
+                        return self.encode_cpu_fallback_prepared(shape, cpu_fallback);
+                    }
                 }
-                Err(err) => {
-                    self.invalidate_shape_cache(shape);
-                    onnx_diag!(
-                        "MIGraphX warm shape {:?} failed validation/run, falling back to CPU: {err:#}",
-                        shape
-                    );
-                    return self.cpu_model()?.encode_prepared_documents(
-                        trim_prepared_batch_for_cpu_fallback(cpu_fallback)?,
-                    );
-                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.invalidate_shape_cache(shape);
+                onnx_diag!(
+                    "MIGraphX warm shape {:?} could not be loaded, falling back to CPU: {err:#}",
+                    shape
+                );
+                return self.encode_cpu_fallback_prepared(shape, prepared);
             }
         }
 
-        if let Some((tail_shape, model)) = self.warm_tail_shape_model_if_warm(&prepared)? {
-            let cpu_fallback = prepared.clone();
-            let padded = pad_prepared_batch_rows_for_migraphx_tail(
-                prepared,
-                tail_shape.batch_size,
-                &self.config,
-            )?;
-            match model.encode_prepared_documents(padded) {
-                Ok(embeddings) => {
-                    onnx_diag!(
-                        "MIGraphX hybrid used warm padded tail shape {:?} for {} real rows",
-                        tail_shape,
-                        cpu_fallback.batch_size
-                    );
-                    return Ok(embeddings);
+        match self.warm_tail_shape_model_if_warm(&prepared) {
+            Ok(Some((tail_shape, model))) => {
+                let cpu_fallback = prepared.clone();
+                let documents = prepared.batch_size;
+                let padded = pad_prepared_batch_rows_for_migraphx_tail(
+                    prepared,
+                    tail_shape.batch_size,
+                    &self.config,
+                )?;
+                let run_start = Instant::now();
+                match model.encode_prepared_documents(padded) {
+                    Ok(embeddings) => {
+                        self.record_warm_tail_gpu_hit(tail_shape, documents, elapsed_ns(run_start));
+                        onnx_diag!(
+                            "MIGraphX hybrid used warm padded tail shape {:?} for {} real rows",
+                            tail_shape,
+                            cpu_fallback.batch_size
+                        );
+                        return Ok(embeddings);
+                    }
+                    Err(err) => {
+                        self.invalidate_shape_cache(tail_shape);
+                        onnx_diag!(
+                            "MIGraphX warm padded tail shape {:?} failed validation/run, falling back to CPU: {err:#}",
+                            tail_shape
+                        );
+                        return self.encode_cpu_fallback_prepared(shape, cpu_fallback);
+                    }
                 }
-                Err(err) => {
-                    self.invalidate_shape_cache(tail_shape);
-                    onnx_diag!(
-                        "MIGraphX warm padded tail shape {:?} failed validation/run, falling back to CPU: {err:#}",
-                        tail_shape
-                    );
-                    return self.cpu_model()?.encode_prepared_documents(
-                        trim_prepared_batch_for_cpu_fallback(cpu_fallback)?,
-                    );
-                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                onnx_diag!(
+                    "MIGraphX warm padded tail shape for {:?} could not be loaded, falling back to CPU: {err:#}",
+                    shape
+                );
+                return self.encode_cpu_fallback_prepared(shape, prepared);
             }
         }
 
@@ -4001,8 +4529,7 @@ impl MigraphxHybrid {
             .unwrap_or(shape);
         self.maybe_warm_shape(warm_shape)?;
         onnx_diag!("MIGraphX hybrid CPU fallback for cold shape {:?}", shape);
-        self.cpu_model()?
-            .encode_prepared_documents(trim_prepared_batch_for_cpu_fallback(prepared)?)
+        self.encode_cpu_fallback_prepared(shape, prepared)
     }
 
     fn encode_prepared_document_batches(
@@ -4020,7 +4547,7 @@ impl MigraphxHybrid {
         }
 
         let mut encoded_segments: Vec<(usize, Vec<Array2<f32>>)> = Vec::new();
-        let mut cpu_batches: Vec<(usize, PreparedDocumentBatch)> = Vec::new();
+        let mut cpu_batches: Vec<(usize, MigraphxStaticShape, PreparedDocumentBatch)> = Vec::new();
 
         for (batch_idx, prepared) in prepared_batches.into_iter().enumerate() {
             let shape = MigraphxStaticShape {
@@ -4031,8 +4558,11 @@ impl MigraphxHybrid {
             match self.shape_model_if_warm(shape) {
                 Ok(Some(model)) => {
                     let cpu_fallback = prepared.clone();
+                    let documents = prepared.batch_size;
+                    let run_start = Instant::now();
                     match model.encode_prepared_documents(prepared) {
                         Ok(embeddings) => {
+                            self.record_warm_gpu_hit(shape, documents, elapsed_ns(run_start));
                             onnx_diag!("MIGraphX hybrid used warm shape {:?}", shape);
                             encoded_segments.push((batch_idx, embeddings));
                         }
@@ -4042,22 +4572,27 @@ impl MigraphxHybrid {
                                 "MIGraphX warm shape {:?} failed validation/run, falling back to CPU: {err:#}",
                                 shape
                             );
-                            cpu_batches.push((batch_idx, cpu_fallback));
+                            cpu_batches.push((batch_idx, shape, cpu_fallback));
                         }
                     }
                 }
-                Ok(None) => {
-                    if let Some((tail_shape, model)) =
-                        self.warm_tail_shape_model_if_warm(&prepared)?
-                    {
+                Ok(None) => match self.warm_tail_shape_model_if_warm(&prepared) {
+                    Ok(Some((tail_shape, model))) => {
                         let cpu_fallback = prepared.clone();
+                        let documents = prepared.batch_size;
                         let padded = pad_prepared_batch_rows_for_migraphx_tail(
                             prepared,
                             tail_shape.batch_size,
                             &self.config,
                         )?;
+                        let run_start = Instant::now();
                         match model.encode_prepared_documents(padded) {
                             Ok(embeddings) => {
+                                self.record_warm_tail_gpu_hit(
+                                    tail_shape,
+                                    documents,
+                                    elapsed_ns(run_start),
+                                );
                                 onnx_diag!(
                                     "MIGraphX hybrid used warm padded tail shape {:?} for {} real rows",
                                     tail_shape,
@@ -4071,42 +4606,63 @@ impl MigraphxHybrid {
                                     "MIGraphX warm padded tail shape {:?} failed validation/run, falling back to CPU: {err:#}",
                                     tail_shape
                                 );
-                                cpu_batches.push((batch_idx, cpu_fallback));
+                                cpu_batches.push((batch_idx, shape, cpu_fallback));
                             }
                         }
-                    } else {
+                    }
+                    Ok(None) => {
                         let warm_shape = self
                             .warm_tail_shape_for_prepared(&prepared)
                             .unwrap_or(shape);
                         self.maybe_warm_shape(warm_shape)?;
                         onnx_diag!("MIGraphX hybrid CPU fallback for cold shape {:?}", shape);
-                        cpu_batches.push((batch_idx, prepared));
+                        cpu_batches.push((batch_idx, shape, prepared));
                     }
-                }
+                    Err(err) => {
+                        onnx_diag!(
+                            "MIGraphX warm padded tail shape for {:?} could not be loaded, falling back to CPU: {err:#}",
+                            shape
+                        );
+                        cpu_batches.push((batch_idx, shape, prepared));
+                    }
+                },
                 Err(err) => {
                     self.invalidate_shape_cache(shape);
                     onnx_diag!(
                         "MIGraphX warm shape {:?} could not be loaded, falling back to CPU: {err:#}",
                         shape
                     );
-                    cpu_batches.push((batch_idx, prepared));
+                    cpu_batches.push((batch_idx, shape, prepared));
                 }
             }
         }
 
         if !cpu_batches.is_empty() {
-            let counts: Vec<(usize, usize)> = cpu_batches
-                .iter()
-                .map(|(idx, batch)| (*idx, batch.batch_size))
-                .collect();
+            let mut counts: Vec<(usize, MigraphxStaticShape, usize, u128)> = Vec::new();
             let batches = cpu_batches
                 .into_iter()
-                .map(|(_, batch)| trim_prepared_batch_for_cpu_fallback(batch))
+                .map(|(idx, shape, batch)| {
+                    let trimmed = trim_prepared_batch_for_cpu_fallback(batch)?;
+                    let weight = (trimmed.tensor_batch_size as u128)
+                        .saturating_mul(trimmed.batch_max_len as u128);
+                    counts.push((idx, shape, trimmed.batch_size, weight));
+                    Ok(trimmed)
+                })
                 .collect::<Result<Vec<_>>>()?;
+            let total_weight = counts
+                .iter()
+                .fold(0u128, |sum, (_, _, _, weight)| sum.saturating_add(*weight));
+            let cpu_start = Instant::now();
             let cpu_model = self.cpu_model()?;
             let cpu_encoded = cpu_model.encode_prepared_batches_unordered(batches)?;
+            let cpu_total_ns = elapsed_ns(cpu_start);
             let mut iter = cpu_encoded.into_iter();
-            for (batch_idx, count) in counts {
+            for (batch_idx, shape, count, weight) in counts {
+                self.record_cpu_fallback(
+                    shape,
+                    count,
+                    apportion_ns(cpu_total_ns, weight, total_weight),
+                );
                 let mut embeddings = Vec::with_capacity(count);
                 for _ in 0..count {
                     embeddings.push(iter.next().ok_or_else(|| {
@@ -4129,6 +4685,7 @@ impl MigraphxHybrid {
         for (_, embeddings) in encoded_segments {
             encoded.extend(embeddings);
         }
+        self.log_performance_snapshot();
         restore_original_input_order(encoded, combined_indices, has_reordering)
     }
 
@@ -4156,6 +4713,7 @@ impl MigraphxHybrid {
             )?;
             encoded.extend(self.encode_one_prepared(prepared)?);
         }
+        self.log_performance_snapshot();
         Ok(encoded)
     }
 
@@ -5172,6 +5730,56 @@ mod tests {
         assert!(!can_pad_migraphx_warm_tail_rows_with_factor(7, 7, 2));
         assert!(!can_pad_migraphx_warm_tail_rows_with_factor(7, 16, 2));
         assert!(!can_pad_migraphx_warm_tail_rows_with_factor(0, 16, 2));
+    }
+
+    #[test]
+    fn test_migraphx_hybrid_performance_counters_snapshot() {
+        let shape = MigraphxStaticShape {
+            batch_size: 4,
+            sequence_length: 512,
+        };
+        let tail_shape = MigraphxStaticShape {
+            batch_size: 8,
+            sequence_length: 512,
+        };
+
+        let mut stats = MigraphxHybridPerformanceStats::default();
+        stats.record_warm_gpu_hit(shape, 4, 2_000_000);
+        stats.record_warm_gpu_hit(shape, 4, 4_000_000);
+        stats.record_warm_tail_gpu_hit(tail_shape, 3, 3_000_000);
+        stats.record_cpu_fallback(shape, 2, 10_000_000);
+        stats.record_cache_load(shape, 1_000_000, false);
+        stats.record_cache_load(shape, 2_000_000, true);
+        stats.record_warm_attempt(tail_shape, 5_000_000, true);
+        stats.record_background_warm_request(tail_shape);
+        stats.record_background_warmer_process_spawn(&[shape, tail_shape]);
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.warm_gpu_hits, 2);
+        assert_eq!(snapshot.warm_gpu_documents, 8);
+        assert_eq!(snapshot.warm_gpu_total_ns, 6_000_000);
+        assert_eq!(snapshot.warm_gpu_avg_ns, 3_000_000);
+        assert_eq!(snapshot.warm_tail_gpu_hits, 1);
+        assert_eq!(snapshot.cpu_fallbacks, 1);
+        assert_eq!(snapshot.cache_loads, 2);
+        assert_eq!(snapshot.cache_load_failures, 1);
+        assert_eq!(snapshot.background_warmer_process_spawns, 1);
+        assert_eq!(snapshot.per_shape.len(), 2);
+
+        let shape_stats = snapshot
+            .per_shape
+            .iter()
+            .find(|stats| stats.shape == shape)
+            .unwrap();
+        assert_eq!(shape_stats.warm_gpu_hits, 2);
+        assert_eq!(shape_stats.warm_gpu_avg_ns, 3_000_000);
+        assert_eq!(shape_stats.cpu_fallbacks, 1);
+        assert_eq!(shape_stats.cache_load_failures, 1);
+
+        let summary = snapshot.summary_line();
+        assert!(summary.contains("gpu_hits=3"));
+        assert!(summary.contains("cpu_fallbacks=1"));
+        assert!(summary.contains("cache_load_failures=1"));
     }
 
     #[test]
