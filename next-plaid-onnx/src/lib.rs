@@ -57,9 +57,10 @@ use ort::value::Tensor;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2676,6 +2677,199 @@ fn write_migraphx_validation_marker(marker_path: &Path, shape: MigraphxStaticSha
     .context("Failed to write MIGraphX shape-cache validation marker")
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hash_file_sha256(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to open {} for hashing", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {} for hashing", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+fn metadata_fingerprint(path: &Path) -> String {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut parts = vec![format!("path={}", canonical.display())];
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            parts.push(format!("len={}", metadata.len()));
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                    parts.push(format!(
+                        "mtime={}.{}",
+                        duration.as_secs(),
+                        duration.subsec_nanos()
+                    ));
+                }
+            }
+        }
+        Err(err) => parts.push(format!("metadata_error={err}")),
+    }
+    parts.join(";")
+}
+
+fn onnxruntime_dylib_path_for_cache_key() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("ORT_DYLIB_PATH") {
+        if !path.trim().is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+
+    find_onnxruntime_library().map(PathBuf::from)
+}
+
+fn onnxruntime_dylib_fingerprint() -> String {
+    onnxruntime_dylib_path_for_cache_key()
+        .map(|path| metadata_fingerprint(&path))
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn migraphx_provider_library_fingerprint() -> String {
+    let mut candidates = Vec::new();
+
+    if let Some(ort_path) = onnxruntime_dylib_path_for_cache_key() {
+        if let Some(parent) = ort_path.parent() {
+            candidates.push(parent.join("libonnxruntime_providers_migraphx.so"));
+            candidates.push(parent.join("onnxruntime_providers_migraphx.dll"));
+        }
+    }
+
+    candidates.extend([
+        PathBuf::from("/usr/lib/libonnxruntime_providers_migraphx.so"),
+        PathBuf::from("/usr/local/lib/libonnxruntime_providers_migraphx.so"),
+        PathBuf::from("/opt/rocm/lib/libonnxruntime_providers_migraphx.so"),
+    ]);
+
+    candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .map(|path| metadata_fingerprint(&path))
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn migraphx_driver_version_fingerprint() -> String {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            Command::new("migraphx-driver")
+                .arg("--version")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .ok()
+                .and_then(|output| {
+                    if output.status.success() {
+                        let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        if !stderr.trim().is_empty() {
+                            if !text.trim().is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(stderr.trim());
+                        }
+                        Some(text.trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "unavailable".to_string())
+        })
+        .clone()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_kfd_gpu_topology_fingerprint() -> Option<String> {
+    let nodes = fs::read_dir("/sys/class/kfd/kfd/topology/nodes").ok()?;
+    let mut entries = Vec::new();
+
+    for node in nodes.flatten() {
+        let node_path = node.path();
+        let properties = fs::read_to_string(node_path.join("properties")).ok()?;
+        let mut selected = BTreeMap::new();
+        for line in properties.lines() {
+            let mut parts = line.split_whitespace();
+            let Some(key) = parts.next() else { continue };
+            let Some(value) = parts.next() else { continue };
+            if matches!(
+                key,
+                "gfx_target_version" | "vendor_id" | "device_id" | "simd_count"
+            ) {
+                selected.insert(key.to_string(), value.to_string());
+            }
+        }
+
+        if selected
+            .get("gfx_target_version")
+            .is_some_and(|value| value != "0")
+        {
+            if let Ok(gpu_id) = fs::read_to_string(node_path.join("gpu_id")) {
+                selected.insert("gpu_id".to_string(), gpu_id.trim().to_string());
+            }
+            let node_name = node.file_name().to_string_lossy().to_string();
+            entries.push(format!("node={node_name};{:?}", selected));
+        }
+    }
+
+    if entries.is_empty() {
+        None
+    } else {
+        entries.sort();
+        Some(entries.join("|"))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_kfd_gpu_topology_fingerprint() -> Option<String> {
+    None
+}
+
+fn migraphx_gpu_fingerprint() -> String {
+    let mut parts = Vec::new();
+
+    if let Some(topology) = linux_kfd_gpu_topology_fingerprint() {
+        parts.push(format!("kfd={topology}"));
+    }
+
+    for name in [
+        "HSA_OVERRIDE_GFX_VERSION",
+        "HIP_VISIBLE_DEVICES",
+        "ROCR_VISIBLE_DEVICES",
+        "GPU_DEVICE_ORDINAL",
+        "CUDA_VISIBLE_DEVICES",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            let value = value.trim();
+            if !value.is_empty() {
+                parts.push(format!("{name}={value}"));
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        "unavailable".to_string()
+    } else {
+        parts.join(";")
+    }
+}
+
 fn dummy_prepared_batch_for_migraphx_shape(
     config: &ColbertConfig,
     shape: MigraphxStaticShape,
@@ -2943,7 +3137,7 @@ struct MigraphxCacheOptions {
 
 impl MigraphxCacheOptions {
     fn from_env() -> Self {
-        let mut entries = Vec::new();
+        let mut entries = vec![("device_id".to_string(), "0".to_string())];
 
         if migraphx_env_flag_enabled("NEXT_PLAID_MIGRAPHX_FP16") {
             entries.push(("migraphx_fp16_enable".to_string(), "1".to_string()));
@@ -2987,32 +3181,65 @@ fn cache_key_for_onnx_with_options(
     quantized: bool,
     migraphx_options: MigraphxCacheOptions,
 ) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    // Include MIGraphX provider options in the cache key. Options such as
-    // `migraphx_fp16_enable` change the compiled MXR program, and sharing a
-    // validated marker/cache directory across option sets can make a later run
-    // load an incompatible graph. Bump the namespace so older option-agnostic
-    // cache directories are not treated as validated for new runs.
-    "migraphx-static-cache-v2".hash(&mut hasher);
-    quantized.hash(&mut hasher);
-    migraphx_options.hash(&mut hasher);
-    path.canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .display()
-        .to_string()
-        .hash(&mut hasher);
+    let mut hasher = Sha256::new();
 
-    if let Ok(metadata) = fs::metadata(path) {
-        metadata.len().hash(&mut hasher);
-        if let Ok(modified) = metadata.modified() {
-            if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
-                duration.as_secs().hash(&mut hasher);
-                duration.subsec_nanos().hash(&mut hasher);
-            }
-        }
+    fn add_entry(hasher: &mut Sha256, key: &str, value: &str) {
+        hasher.update(key.as_bytes());
+        hasher.update([0]);
+        hasher.update(value.as_bytes());
+        hasher.update([0xff]);
     }
 
-    format!("{:016x}", hasher.finish())
+    // This key is the model/provider/runtime prefix of the full cache path:
+    // `<cache-root>/<model-cache-key>/<batch>x<sequence>/`. The trailing shape
+    // directory contributes the static ONNX input shape. Everything below can
+    // affect MIGraphX's compiled MXR program and must not share a validation
+    // marker/cache directory across incompatible runs.
+    add_entry(&mut hasher, "namespace", "migraphx-static-cache-v3");
+    add_entry(&mut hasher, "quantized", &quantized.to_string());
+    add_entry(
+        &mut hasher,
+        "model_path",
+        &path
+            .canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .display()
+            .to_string(),
+    );
+    add_entry(
+        &mut hasher,
+        "model_sha256",
+        &hash_file_sha256(path).unwrap_or_else(|err| format!("unavailable:{err:#}")),
+    );
+    add_entry(
+        &mut hasher,
+        "ort_api_version",
+        &ort::MINOR_VERSION.to_string(),
+    );
+    add_entry(
+        &mut hasher,
+        "onnxruntime_dylib",
+        &onnxruntime_dylib_fingerprint(),
+    );
+    add_entry(
+        &mut hasher,
+        "migraphx_provider_library",
+        &migraphx_provider_library_fingerprint(),
+    );
+    add_entry(
+        &mut hasher,
+        "migraphx_driver_version",
+        &migraphx_driver_version_fingerprint(),
+    );
+    add_entry(&mut hasher, "gpu", &migraphx_gpu_fingerprint());
+
+    let mut option_entries = migraphx_options.entries;
+    option_entries.sort();
+    for (key, value) in option_entries {
+        add_entry(&mut hasher, &format!("migraphx_option:{key}"), &value);
+    }
+
+    hex_encode(&hasher.finalize())
 }
 
 fn shape_cache_has_mxr(cache_dir: &Path) -> bool {
@@ -4994,6 +5221,41 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn test_migraphx_cache_key_hashes_model_contents() {
+        let unique = format!(
+            "next-plaid-cache-key-content-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("model.onnx");
+
+        fs::write(&path, b"same-length-a").unwrap();
+        let first_key = cache_key_for_onnx_with_options(
+            &path,
+            false,
+            MigraphxCacheOptions {
+                entries: Vec::new(),
+            },
+        );
+        fs::write(&path, b"same-length-b").unwrap();
+        let second_key = cache_key_for_onnx_with_options(
+            &path,
+            false,
+            MigraphxCacheOptions {
+                entries: Vec::new(),
+            },
+        );
+
+        assert_ne!(first_key, second_key);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(feature = "migraphx")]
